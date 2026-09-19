@@ -17,16 +17,27 @@ off" with a log line.
 
 from __future__ import annotations
 
-from . import board_control, board_model, cli_commands, core, dispatch_guard, log_stamps, worker_context
+from . import (
+    board_control,
+    board_model,
+    cli_commands,
+    core,
+    dispatch_guard,
+    log_stamps,
+    self_update,
+    worker_context,
+)
 from .core import logger
 
-__all__ = ["register", "board_control", "board_model", "dispatch_guard", "log_stamps", "worker_context"]
+__all__ = ["register", "board_control", "board_model", "dispatch_guard", "log_stamps", "self_update",
+           "worker_context"]
 
 _SETTING_KEYS = (
     "stop_terminates_workers",
     "log_timestamps",
     "worker_context_snapshots",
     "context_snapshot_interval_seconds",
+    "update_check",
 )
 
 

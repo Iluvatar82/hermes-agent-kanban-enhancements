@@ -401,6 +401,33 @@ describe('eventLabel', () => {
   })
 })
 
+describe('updateState', () => {
+  it('puts "restart" ahead of "available"', () => {
+    // The update already landed on disk; telling anyone to download it again
+    // is the one genuinely confusing thing this row could say.
+    assert.equal(
+      plugin.updateState({ can_update: true, restart_required: true, update_available: true }),
+      'restart'
+    )
+  })
+
+  it('names the other three states', () => {
+    assert.equal(plugin.updateState({ can_update: true, update_available: true }), 'available')
+    assert.equal(plugin.updateState({ can_update: true, update_available: false }), 'current')
+    assert.equal(plugin.updateState({ can_update: false, update_available: true }), 'unavailable')
+    assert.equal(plugin.updateState(undefined), 'current')
+  })
+})
+
+describe('versionLabel', () => {
+  it('shows both versions only while they disagree', () => {
+    assert.equal(plugin.versionLabel({ installed: '0.3.0', running: '0.3.0' }), 'Kanban+ 0.3.0')
+    assert.equal(plugin.versionLabel({ installed: '0.4.0', running: '0.3.0' }), 'Kanban+ 0.3.0 → 0.4.0')
+    assert.equal(plugin.versionLabel({ running: '0.3.0' }), 'Kanban+ 0.3.0')
+    assert.equal(plugin.versionLabel(undefined), 'Kanban+')
+  })
+})
+
 describe('element construction', () => {
   // `jsx(Component)` without a props object throws "Cannot read properties of
   // undefined (reading 'key')" inside React's real runtime and takes the whole

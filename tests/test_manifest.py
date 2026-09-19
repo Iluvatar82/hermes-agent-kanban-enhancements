@@ -43,6 +43,7 @@ def test_the_loader_still_reads_every_setting(manifest):
     assert set(parsed["config_schema"]) == {
         "stop_terminates_workers", "log_timestamps",
         "worker_context_snapshots", "context_snapshot_interval_seconds",
+        "update_check",
     }
     assert parsed["license"] == "MIT" and parsed["homepage"].startswith("https://")
     assert "kanban" in parsed["tags"]
@@ -70,7 +71,11 @@ def test_one_version_in_all_three_places(manifest):
 
     dashboard = json.loads(
         (MANIFEST.parent / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
-    served = re.search(r'"plugin_version": "([^"]+)"',
-                       (MANIFEST.parent / "dashboard" / "plugin_api.py").read_text(encoding="utf-8"))
+    # The served version is a literal in the module, not a read of plugin.yaml:
+    # an update swaps that file while the module stays loaded, and the gap
+    # between the two is what /version reports as "restart required".
+    served = re.search(r'^_PLUGIN_VERSION = "([^"]+)"',
+                       (MANIFEST.parent / "dashboard" / "plugin_api.py").read_text(encoding="utf-8"),
+                       re.MULTILINE)
     assert dashboard["version"] == manifest["version"]
     assert served is not None and served.group(1) == manifest["version"]
