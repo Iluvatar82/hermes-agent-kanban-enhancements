@@ -191,9 +191,57 @@ describe('buildLogRows', () => {
     assert.equal(lines('[2026-09-17T08:00:00Z] 10%\r50%\r100%')[0].text, '100%')
   })
 
+  it('keeps the line a Windows log ends with \\r\\r\\n', () => {
+    // The bug this test exists for: a worker's text stream rewrites its `\n`
+    // as `\r\n`, so a line that was ALREADY CRLF reaches the file doubled.
+    // Read as "everything after the last \r", every row came out blank — a
+    // 26 KiB log rendered as an empty box.
+    const rows = lines('[2026-09-17T08:00:00Z] built in 3.4s\r\r\n[2026-09-17T08:00:01Z] done\r\r\n')
+
+    assert.deepEqual(rows.map(row => row.text), ['built in 3.4s', 'done'])
+  })
+
+  it('keeps a line whose only carriage return is the one at its end', () => {
+    assert.deepEqual(lines('plain\r\nlines\r\n').map(row => row.text), ['plain', 'lines'])
+    assert.equal(lines('cursor parked\r')[0].text, 'cursor parked')
+  })
+
   it('survives empty and missing input', () => {
     assert.deepEqual(plugin.buildLogRows(''), [])
     assert.deepEqual(plugin.buildLogRows(null), [])
+  })
+})
+
+describe('collapseCarriageReturns', () => {
+  const collapse = plugin.collapseCarriageReturns
+
+  it('keeps the last frame that actually wrote something', () => {
+    assert.equal(collapse('10%\r50%\r100%'), '100%')
+    assert.equal(collapse('done\r\r'), 'done')
+    assert.equal(collapse('no returns here'), 'no returns here')
+    assert.equal(collapse('\r\r'), '')
+  })
+})
+
+describe('plainLogText', () => {
+  it('drops the stamps, the ANSI and the carriage returns, keeps the lines', () => {
+    const log = [
+      '[2026-09-17T08:00:00Z] \u001b[32mstarting\u001b[0m\r',
+      '[2026-09-17T08:00:01Z] 10%\r100%\r',
+      'no stamp at all\r',
+      ''
+    ].join('\n')
+
+    assert.equal(plugin.plainLogText(log), 'starting\n100%\nno stamp at all\n')
+  })
+
+  it('leaves a bracket that is not a stamp alone', () => {
+    assert.equal(plugin.plainLogText('[exit 128] see above'), '[exit 128] see above')
+  })
+
+  it('survives empty and missing input', () => {
+    assert.equal(plugin.plainLogText(''), '')
+    assert.equal(plugin.plainLogText(null), '')
   })
 })
 

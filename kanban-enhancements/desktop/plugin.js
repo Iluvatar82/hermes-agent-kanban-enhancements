@@ -222,7 +222,7 @@ const stateKey = slug => ['kanban-plus', 'state', slug]
 const tasksKey = slug => ['kanban-plus', 'tasks', slug]
 const boardKey = slug => ['kanban-plus', 'board', slug]
 const TASK_KEY = ['kanban-plus', 'task']
-const logKey = (slug, id) => ['kanban-plus', 'log', slug, id]
+const logKey = (slug, id, view) => ['kanban-plus', 'log', slug, id, view]
 const contextKey = (slug, id) => ['kanban-plus', 'context', slug, id]
 const taskKey = (slug, id) => ['kanban-plus', 'task', slug, id]
 
@@ -233,8 +233,19 @@ const stopBoard = reason => api(withBoard('/stop'), { method: 'POST', body: reas
 const startBoard = () => api(withBoard('/start'), { method: 'POST' })
 const putMaxParallel = value => api(withBoard('/max-parallel'), { method: 'PUT', body: { value } })
 const putBoardModel = (model, provider) => api(withBoard('/model'), { method: 'PUT', body: { model, provider } })
-const fetchTaskLog = id =>
-  api(withBoard(`/tasks/${encodeURIComponent(id)}/log`, { tail: '1048576', timestamps: 'true' }))
+// Two tails, because the two views want different things. The task drawer
+// wants a glance — core's own drawer asks for the same 16 KiB — and polls it
+// every three seconds; the overlay wants the archive and is opened on purpose.
+// Stamps ride along only where there is a gutter to put them in.
+const SMALL_LOG_TAIL = 16_384
+const FULL_LOG_TAIL = 1_048_576
+const fetchTaskLog = (id, full) =>
+  api(
+    withBoard(`/tasks/${encodeURIComponent(id)}/log`, {
+      tail: String(full ? FULL_LOG_TAIL : SMALL_LOG_TAIL),
+      timestamps: full ? 'true' : 'false'
+    })
+  )
 const fetchTaskContext = id => api(withBoard(`/tasks/${encodeURIComponent(id)}/context`))
 const fetchTaskDetail = id => api(withBoard(`/tasks/${encodeURIComponent(id)}`))
 const patchTask = (id, patch) =>
@@ -295,6 +306,57 @@ function localDayKey(date) {
 }
 
 /**
+ * What a terminal would still show after a line's carriage returns: the last
+ * frame that actually wrote something.
+ *
+ * Reading it as "everything after the last \r" is what blanked the log. A
+ * worker's stdout is a TEXT stream, so on Windows every `\n` it writes becomes
+ * `\r\n` — and a line the worker echoed from a child process (already CRLF)
+ * reaches the file as `\r\r\n`. Slice after the last `\r` there and every
+ * single line comes out empty: 26 KiB of log, 300 blank rows, nothing on
+ * screen. A `\r` with nothing behind it parks the cursor; it erases nothing.
+ */
+export function collapseCarriageReturns(line) {
+  if (!line.includes('\r')) {
+    return line
+  }
+
+  const frames = line.split('\r')
+
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    if (frames[index] !== '') {
+      return frames[index]
+    }
+  }
+
+  return ''
+}
+
+/** One raw log line as it deserves to be read: no progress frames, no ANSI. */
+export function logLineText(line) {
+  return stripAnsi(collapseCarriageReturns(String(line ?? '')))
+}
+
+/**
+ * The log as plain text: stamps dropped, every line sanitised, nothing else
+ * touched. This is what the small view renders — one `whitespace-pre-wrap`
+ * block, the shape core's own task drawer uses — so a screenful of log costs
+ * one DOM node instead of one per line.
+ */
+export function plainLogText(content) {
+  const text = String(content ?? '')
+
+  if (!text) {
+    return ''
+  }
+
+  return text
+    .split('\n')
+    .map(line => logLineText(line.startsWith('[') ? line.replace(STAMP_RE, '') : line))
+    .join('\n')
+}
+
+/**
  * Split a stamped log into display rows: one `{kind:'line'}` per line, plus a
  * `{kind:'day'}` divider whenever the LOCAL date changes. A line's carriage
  * returns collapse to what a terminal would show last (progress bars), and
@@ -316,7 +378,7 @@ export function buildLogRows(content) {
   let lastIso = ''
 
   for (const raw of lines) {
-    let line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+    let line = raw
     const match = STAMP_RE.exec(line)
     let iso = null
     let at = null
@@ -331,8 +393,7 @@ export function buildLogRows(content) {
       }
     }
 
-    const cr = line.lastIndexOf('\r')
-    const text = stripAnsi(cr >= 0 ? line.slice(cr + 1) : line)
+    const text = logLineText(line)
 
     if (!iso || !at) {
       rows.push({ iso: null, kind: 'line', repeat: false, text, time: '', title: '' })
@@ -813,11 +874,13 @@ function TaskContextMeter({ running, taskId }) {
 }
 
 // ── worker log ───────────────────────────────────────────────────────────────
-// Two views of the same file. The task view carries the SMALL one — the tail,
-// plain, enough to see what the worker is doing without pushing the task's own
-// fields off screen. The four-arrow button in its header swaps it for the FULL
-// one: every line the backend sent, with the write-time gutter and the day
-// dividers, filling the page until Esc (or the button) gives the details back.
+// Two views of the same file, and they fetch differently on purpose. The task
+// view carries the SMALL one: core's own 16 KiB tail, unstamped, rendered as
+// ONE block of wrapped text — a glance at what the worker is doing, cheap
+// enough to poll every three seconds. The four-arrow button in its header swaps
+// it for the FULL one: a megabyte of tail with the write-time gutter and the
+// day dividers, filling the page until Esc (or the button) gives the details
+// back.
 
 const LogLine = memo(function LogLine({ row }) {
   return jsxs(Fragment, {
@@ -841,10 +904,10 @@ const LogLine = memo(function LogLine({ row }) {
 })
 
 /**
- * Keep only the last `limit` lines of a log. The small view is a glance, not an
- * archive: rendering a 1 MiB tail into a 12rem box costs thousands of nodes
- * nobody scrolls to. Works on the raw text so the stamps survive for the rows
- * that are kept.
+ * Keep only the last `limit` lines of a log. A megabyte of tail is tens of
+ * thousands of lines, and a two-column grid that big takes seconds to lay out
+ * — the full view draws the newest slice of it instead. Works on the raw text
+ * so the stamps survive for the rows that are kept.
  */
 export function logTail(content, limit) {
   const text = String(content ?? '')
@@ -870,8 +933,10 @@ export function logTail(content, limit) {
   return trailing ? `${kept.join('\n')}\n` : kept.join('\n')
 }
 
-/** Lines the small log keeps — roughly a screenful and a half of scrollback. */
-const SMALL_LOG_LINES = 300
+/** Lines the full view draws. Beyond this the grid costs more to lay out than
+ *  anybody gains from scrolling it; the byte tail above it is the real archive
+ *  and `gekürzt` in the header says when either one bit. */
+const FULL_LOG_LINES = 5_000
 
 /** The log band inside the task drawer, inline for the reason in the file
  *  header. 200px is about a dozen lines — the difference between a glance and a
@@ -884,27 +949,32 @@ const SMALL_LOG_STYLE = { maxHeight: '20rem', minHeight: '200px' }
 const FULL_LOG_STYLE = { lineHeight: 1.6 }
 
 /**
- * The log as a two-column timeline: write time left, text right, day dividers.
- * `compact` drops the gutter and the dividers — the small view has no room for
- * a time column, and the full view is one button away.
+ * The small view: the tail as one wrapped block of monospace text, which is
+ * exactly what core's task drawer does with it. No gutter, no dividers and no
+ * node per line — the four-arrow button is one click away for all three.
  */
-function TimestampedLog({ compact = false, content }) {
+function PlainLog({ text }) {
+  if (!text.trim()) {
+    return jsx('div', { className: 'font-mono text-[0.75rem] text-(--ui-text-quaternary)', children: '—' })
+  }
+
+  return jsx('div', {
+    className:
+      'font-mono text-[0.6875rem] leading-[1.55] break-words whitespace-pre-wrap text-(--ui-text-tertiary)',
+    'data-selectable-text': 'true',
+    children: text
+  })
+}
+
+/**
+ * The full view: a two-column timeline — write time left, text right, a divider
+ * whenever the local date turns over.
+ */
+function TimestampedLog({ content }) {
   const rows = useMemo(() => buildLogRows(content), [content])
 
   if (!rows.length) {
     return jsx('div', { className: 'font-mono text-[0.75rem] text-(--ui-text-quaternary)', children: '—' })
-  }
-
-  if (compact) {
-    return jsx('div', {
-      className: 'flex flex-col font-mono text-[0.6875rem] leading-[1.55] text-(--ui-text-tertiary)',
-      'data-selectable-text': 'true',
-      children: rows
-        .filter(row => row.kind === 'line')
-        .map((row, index) =>
-          jsx('span', { className: 'break-words whitespace-pre-wrap', children: row.text || ' ' }, index)
-        )
-    })
   }
 
   return jsx('div', {
@@ -935,27 +1005,37 @@ function TimestampedLog({ compact = false, content }) {
 /** Pixels from the bottom that still count as "following" the tail. */
 const FOLLOW_SLACK_PX = 48
 
-/** The selected task's log — fast poll while it runs, slow once it is done. */
-function useTaskLog(task) {
+/**
+ * The selected task's log — fast poll while it runs, slow once it is done.
+ * `full` picks the megabyte-and-stamps variant the overlay reads; the two are
+ * separate cache entries, so the drawer keeps polling its cheap tail while the
+ * overlay is closed.
+ */
+function useTaskLog(task, { full = false, paused = false } = {}) {
   const slug = useValue($boardSlug)
 
   return useQuery({
-    enabled: Boolean(task?.id),
-    queryFn: () => fetchTaskLog(task.id),
-    queryKey: logKey(slug, task?.id ?? ''),
+    enabled: Boolean(task?.id) && !paused,
+    queryFn: () => fetchTaskLog(task.id, full),
+    queryKey: logKey(slug, task?.id ?? '', full ? 'full' : 'tail'),
     refetchInterval: task?.status === 'running' ? 3_000 : 15_000
   })
 }
 
-/** `1.2 MiB · gekürzt` — what of the file actually arrived. */
-function logMeta(log) {
+/**
+ * `1.2 MiB · gekürzt` — what of the file actually arrived. Both cuts read the
+ * same: the backend's byte tail (`log.truncated`) and the line budget the full
+ * view draws (`clipped`) leave the reader in the same place, at the newest end
+ * of a file that has more above it.
+ */
+function logMeta(log, clipped = false) {
   const parts = []
 
   if (log?.size_bytes != null) {
     parts.push(formatBytes(log.size_bytes))
   }
 
-  if (log?.truncated) {
+  if (log?.truncated || clipped) {
     parts.push('gekürzt')
   }
 
@@ -1028,10 +1108,11 @@ function LogSizeButton({ expanded, onClick }) {
 }
 
 /** The small log inside the task view: the tail, plain, one button from full. */
-function TaskLogSection({ onExpand, task }) {
-  const { data: log, error, isLoading } = useTaskLog(task)
+function TaskLogSection({ expanded, onExpand, task }) {
+  // Nothing behind the overlay is worth a request every three seconds.
+  const { data: log, error, isLoading } = useTaskLog(task, { paused: expanded })
   const meta = logMeta(log)
-  const tail = useMemo(() => logTail(log?.content ?? '', SMALL_LOG_LINES), [log?.content])
+  const text = useMemo(() => plainLogText(log?.content ?? ''), [log?.content])
   const placeholder = jsx(LogPlaceholder, { error, isLoading, log })
 
   return jsxs(Section, {
@@ -1055,8 +1136,8 @@ function TaskLogSection({ onExpand, task }) {
         placeholder ??
         jsx(LogScroller, {
           className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-2 py-1.5',
-          content: tail,
-          children: jsx(TimestampedLog, { compact: true, content: tail })
+          content: text,
+          children: jsx(PlainLog, { text })
         })
     })
   })
@@ -1068,8 +1149,10 @@ function TaskLogSection({ onExpand, task }) {
  * inward — puts the task's details back.
  */
 function LogOverlay({ onClose, task }) {
-  const { data: log, error, isLoading } = useTaskLog(task)
-  const meta = logMeta(log)
+  const { data: log, error, isLoading } = useTaskLog(task, { full: true })
+  const content = log?.content ?? ''
+  const shown = useMemo(() => logTail(content, FULL_LOG_LINES), [content])
+  const meta = logMeta(log, shown.length < content.length)
   const placeholder = jsx(LogPlaceholder, { error, isLoading, log })
 
   // `inset-0` of the PAGE root (which clips): exactly the space Kanban+ owns,
@@ -1121,8 +1204,8 @@ function LogOverlay({ onClose, task }) {
         ? jsx('div', { className: 'grid min-h-0 flex-1 place-items-center p-6', children: placeholder })
         : jsx(LogScroller, {
             className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-4 py-3',
-            content: log?.content,
-            children: jsx(TimestampedLog, { content: log?.content ?? '' })
+            content: shown,
+            children: jsx(TimestampedLog, { content: shown })
           })
     ]
   })
@@ -3338,7 +3421,7 @@ const PANEL_STYLE = {
   width: 'min(100%, max(22rem, 33.3333%))'
 }
 
-function TaskDetailPanel({ card, columns, onClose, onExpandLog, onOpen, taskId }) {
+function TaskDetailPanel({ card, columns, logExpanded, onClose, onExpandLog, onOpen, taskId }) {
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
   const move = useTaskMove()
@@ -3457,7 +3540,7 @@ function TaskDetailPanel({ card, columns, onClose, onExpandLog, onOpen, taskId }
                       })
                     : null,
                   jsx(LinksSection, { links: detail?.links, onOpen }),
-                  jsx(TaskLogSection, { onExpand: onExpandLog, task: task ?? { id: taskId } }),
+                  jsx(TaskLogSection, { expanded: logExpanded, onExpand: onExpandLog, task: task ?? { id: taskId } }),
                   jsx(CommentsSection, {
                     comments: detail?.comments ?? [],
                     disabled: comment.isPending,
@@ -3676,6 +3759,7 @@ function KanbanPlusPage() {
                 {
                   card: selected,
                   columns: columnNames,
+                  logExpanded,
                   onClose: () => select(null),
                   onExpandLog: () => setLogExpanded(true),
                   onOpen: select,
