@@ -141,7 +141,7 @@ def _state_payload(board: str | None) -> dict[str, Any]:
         "max_in_progress_set": explicit,
         "effective_max_in_progress": pkg.dispatch_guard.effective_cap(),
         "guard_active": pkg.dispatch_guard.is_installed(),
-        "plugin_version": "0.2.0",
+        "plugin_version": "0.2.1",
     }
 
 
