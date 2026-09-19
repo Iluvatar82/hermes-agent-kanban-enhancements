@@ -58,6 +58,11 @@ entry point the desktop's *Install from Git* modal uses — so the result is ide
 by hand, and it can only ever reinstall *this* plugin from the source Hermes recorded for it (a fork
 updates from the fork).
 
+A *Method Not Allowed* from any Kanban+ action is this and nothing else: the page was loaded from
+the new files while the gateway still serves the module it imported at boot, so the UI asks for an
+endpoint that exists on disk but not in the running router. Kanban+ says so in place of the bare HTTP
+text. Restart the gateway.
+
 Two things it deliberately does not hide:
 
 - **It updates the profile the gateway runs under, and only that one.** For every profile, use the
