@@ -34,8 +34,15 @@ if ($LASTEXITCODE -ne 0 -or -not $user) {
 $user = $user.Trim()
 $slug = "$user/$Name"
 
-gh repo view $slug 2>&1 | Out-Null
+# `gh repo view` writes to stderr and exits non-zero when the repository does
+# not exist yet - the normal case here. Windows PowerShell turns that into a
+# NativeCommandError, so stderr goes to $null and the preference is relaxed for
+# this one probe; the exit code is the answer.
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+gh repo view $slug --json name 2>$null | Out-Null
 $exists = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $previousPreference
 
 if ($exists) {
     Write-Host "Repository $slug already exists - pushing." -ForegroundColor Cyan

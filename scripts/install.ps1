@@ -6,7 +6,7 @@
   Copies kanban-enhancements/ into <HERMES_HOME>/plugins/ for the default profile
   and (unless -DefaultOnly) every profile under profiles/, then enables it.
   The online equivalent is:
-    hermes plugins install spitefr/hermes-agent-kanban-enhancements/kanban-enhancements --enable
+    hermes plugins install Iluvatar82/hermes-agent-kanban-enhancements/kanban-enhancements --enable
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\install.ps1

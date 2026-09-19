@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install this plugin from a local clone into one or more Hermes profiles.
 # Online equivalent:
-#   hermes plugins install spitefr/hermes-agent-kanban-enhancements/kanban-enhancements --enable
+#   hermes plugins install Iluvatar82/hermes-agent-kanban-enhancements/kanban-enhancements --enable
 set -euo pipefail
 
 HERMES_ROOT="${HERMES_ROOT:-$HOME/.hermes}"

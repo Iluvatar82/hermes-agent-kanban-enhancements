@@ -23,7 +23,7 @@ The desktop UI is currently German-only. Everything else (CLI, API, logs) is Eng
 ## Install
 
 ```bash
-hermes plugins install spitefr/hermes-agent-kanban-enhancements/kanban-enhancements --enable
+hermes plugins install Iluvatar82/hermes-agent-kanban-enhancements/kanban-enhancements --enable
 ```
 
 That installs the package into `$HERMES_HOME/plugins/kanban-enhancements/` and adds it to
@@ -35,7 +35,7 @@ runs the dispatcher, and once for every profile that runs kanban workers (that i
 those workers timestamped logs and context snapshots):
 
 ```bash
-hermes -p dev_developer plugins install spitefr/hermes-agent-kanban-enhancements/kanban-enhancements --enable
+hermes -p dev_developer plugins install Iluvatar82/hermes-agent-kanban-enhancements/kanban-enhancements --enable
 ```
 
 `scripts/install.ps1` (Windows) and `scripts/install.sh` (macOS/Linux) do that for every profile
@@ -116,7 +116,7 @@ If you hit that, please open an issue with your Hermes version.
 ## Development
 
 ```bash
-git clone https://github.com/spitefr/hermes-agent-kanban-enhancements
+git clone https://github.com/Iluvatar82/hermes-agent-kanban-enhancements
 cd hermes-agent-kanban-enhancements
 HERMES_AGENT_REPO=/path/to/hermes-agent pytest    # 38 tests against a real checkout
 node --test tests/desktop/                        # the desktop helpers, with stubbed SDK

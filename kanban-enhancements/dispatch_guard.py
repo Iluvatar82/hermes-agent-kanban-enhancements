@@ -82,7 +82,7 @@ def install() -> bool:
             "kanban-enhancements: this Hermes build's dispatch_once does not match the expected "
             "signature — board stop/start and the parallel-run cap stay OFF (everything else works). "
             "Please report the Hermes version at "
-            "https://github.com/spitefr/hermes-agent-kanban-enhancements/issues")
+            "https://github.com/Iluvatar82/hermes-agent-kanban-enhancements/issues")
         return False
 
     def dispatch_once(conn, **kwargs) -> Any:
