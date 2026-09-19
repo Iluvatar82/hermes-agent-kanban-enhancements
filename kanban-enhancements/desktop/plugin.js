@@ -24,6 +24,12 @@ import {
   Codicon,
   COMPOSER_AREAS,
   ConfirmDialog,
+  Contribute,
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -42,11 +48,19 @@ import {
   STATUSBAR_AREAS,
   ScrollArea,
   SearchField,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   StatusDot,
   Tip,
+  WORKSPACE_PAGE_HEADER_AREA,
+  atom,
   cn,
   compactNumber,
   host,
+  isSubmitEnter,
   queryClient,
   useMutation,
   useQuery,
@@ -63,6 +77,7 @@ import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
 // if a hot reload ever leaves a stale component behind.
 
 let restCall = null
+let osDoor = null
 
 function api(path, opts) {
   if (!restCall) {
@@ -72,19 +87,75 @@ function api(path, opts) {
   return restCall(path, opts)
 }
 
+/** The plugin's OS door (native save/open dialogs), for components too deep to
+ *  be handed `ctx`. Null before register() and after dispose. */
+function pluginOs() {
+  if (!osDoor) {
+    host.notify({ kind: 'error', message: 'Kanban+ ist nicht geladen.' })
+  }
+
+  return osDoor
+}
+
+// ── the selected board ───────────────────────────────────────────────────────
+// Separate boards are separate databases, so every call carries the slug the
+// user picked and every cache key is scoped by it: switching boards is a clean
+// cache miss, never a stale render of the other board. '' means "whatever the
+// server calls current" — what a fresh install and the CLI agree on.
+
+/** Selected board slug ('' = the server's current board). Persisted. */
+export const $boardSlug = atom('')
+
+const BOARD_SLUG_KEY = 'boardSlug'
+
+/** Append the selected board (and any other params) to a path. */
+export function withBoard(path, params = {}) {
+  const search = new URLSearchParams(params)
+  const slug = $boardSlug.get()
+
+  if (slug) {
+    search.set('board', slug)
+  }
+
+  const qs = search.toString()
+
+  return qs ? `${path}?${qs}` : path
+}
+
+// Board-scoped query keys; the bare prefixes stay usable for invalidation.
 const STATE_KEY = ['kanban-plus', 'state']
 const TASKS_KEY = ['kanban-plus', 'tasks']
-const logKey = id => ['kanban-plus', 'log', id]
-const contextKey = id => ['kanban-plus', 'context', id]
+const BOARD_KEY = ['kanban-plus', 'board']
+const BOARDS_KEY = ['kanban-plus', 'boards']
+const PROJECTS_KEY = ['kanban-plus', 'projects']
+const stateKey = slug => ['kanban-plus', 'state', slug]
+const tasksKey = slug => ['kanban-plus', 'tasks', slug]
+const boardKey = slug => ['kanban-plus', 'board', slug]
+const logKey = (slug, id) => ['kanban-plus', 'log', slug, id]
+const contextKey = (slug, id) => ['kanban-plus', 'context', slug, id]
 
-const fetchState = () => api('/state')
-const fetchTasks = () => api('/tasks')
-const stopBoard = reason => api('/stop', { method: 'POST', body: reason ? { reason } : {} })
-const startBoard = () => api('/start', { method: 'POST' })
-const putMaxParallel = value => api('/max-parallel', { method: 'PUT', body: { value } })
-const putBoardModel = (model, provider) => api('/model', { method: 'PUT', body: { model, provider } })
-const fetchTaskLog = id => api(`/tasks/${encodeURIComponent(id)}/log?tail=1048576&timestamps=true`)
-const fetchTaskContext = id => api(`/tasks/${encodeURIComponent(id)}/context`)
+const fetchState = () => api(withBoard('/state'))
+const fetchTasks = () => api(withBoard('/tasks'))
+const fetchBoard = () => api(withBoard('/board'))
+const stopBoard = reason => api(withBoard('/stop'), { method: 'POST', body: reason ? { reason } : {} })
+const startBoard = () => api(withBoard('/start'), { method: 'POST' })
+const putMaxParallel = value => api(withBoard('/max-parallel'), { method: 'PUT', body: { value } })
+const putBoardModel = (model, provider) => api(withBoard('/model'), { method: 'PUT', body: { model, provider } })
+const fetchTaskLog = id =>
+  api(withBoard(`/tasks/${encodeURIComponent(id)}/log`, { tail: '1048576', timestamps: 'true' }))
+const fetchTaskContext = id => api(withBoard(`/tasks/${encodeURIComponent(id)}/context`))
+
+// The board directory itself. `ctx.rest` cannot leave this plugin's namespace,
+// so these mirror core's own `/boards` endpoints rather than borrowing them.
+const fetchBoards = () => api('/boards')
+const fetchProjects = () => api('/projects')
+const createBoard = (slug, name, projectId) =>
+  api('/boards', { method: 'POST', body: { slug, name, ...(projectId ? { project_id: projectId } : {}) } })
+const updateBoard = (slug, patch) => api(`/boards/${encodeURIComponent(slug)}`, { method: 'PATCH', body: patch })
+const deleteBoard = slug => api(`/boards/${encodeURIComponent(slug)}`, { method: 'DELETE' })
+const exportBoard = (slug, output) =>
+  api(`/boards/${encodeURIComponent(slug)}/export`, { method: 'POST', body: { output } })
+const importBoard = archive => api('/boards/import', { method: 'POST', body: { archive } })
 
 /** Invalidate everything a stop/start can have moved — usable outside React. */
 function refreshAll(qc) {
@@ -92,6 +163,10 @@ function refreshAll(qc) {
 
   void client.invalidateQueries({ queryKey: STATE_KEY })
   void client.invalidateQueries({ queryKey: TASKS_KEY })
+  // A stop reclaims running tasks back into Ready, so the lanes moved too.
+  void client.invalidateQueries({ queryKey: BOARD_KEY })
+  // A stop/start also flips the switcher's per-board marker.
+  void client.invalidateQueries({ queryKey: BOARDS_KEY })
 }
 
 // ── pure helpers (also named exports, so they can be unit-tested) ─────────────
@@ -327,22 +402,27 @@ function useTicker(active, intervalMs) {
 
 const SELECTED_TASK_KEY = 'hermes.plugin.kanban-enhancements.selectedTask'
 
+/** Per board: a task id from one board means nothing on the next one. */
+export function selectedTaskKey(slug) {
+  return slug ? `${SELECTED_TASK_KEY}.${slug}` : SELECTED_TASK_KEY
+}
+
 // localStorage throws in a locked-down renderer; a remembered selection is a
 // convenience, never a correctness requirement.
-function readSelectedTask() {
+function readSelectedTask(slug) {
   try {
-    return localStorage.getItem(SELECTED_TASK_KEY)
+    return localStorage.getItem(selectedTaskKey(slug))
   } catch {
     return null
   }
 }
 
-function writeSelectedTask(id) {
+function writeSelectedTask(slug, id) {
   try {
     if (id) {
-      localStorage.setItem(SELECTED_TASK_KEY, id)
+      localStorage.setItem(selectedTaskKey(slug), id)
     } else {
-      localStorage.removeItem(SELECTED_TASK_KEY)
+      localStorage.removeItem(selectedTaskKey(slug))
     }
   } catch {
     // ignored — see readSelectedTask
@@ -520,10 +600,12 @@ function ContextBar({ align = 'end', className, header, showLabel = true, side =
 
 /** The selected task's worker context — fast poll while it runs, slow after. */
 function TaskContextMeter({ running, taskId }) {
+  const slug = useValue($boardSlug)
+
   const { data } = useQuery({
     enabled: Boolean(taskId),
     queryFn: () => fetchTaskContext(taskId),
-    queryKey: contextKey(taskId ?? ''),
+    queryKey: contextKey(slug, taskId ?? ''),
     refetchInterval: running ? 10_000 : 60_000
   })
 
@@ -618,6 +700,7 @@ const FOLLOW_SLACK_PX = 48
  */
 function WorkerLogPanel({ task }) {
   const running = task.status === 'running'
+  const slug = useValue($boardSlug)
   const scrollRef = useRef(null)
   const followRef = useRef(true)
 
@@ -627,7 +710,7 @@ function WorkerLogPanel({ task }) {
     isLoading
   } = useQuery({
     queryFn: () => fetchTaskLog(task.id),
-    queryKey: logKey(task.id),
+    queryKey: logKey(slug, task.id),
     refetchInterval: running ? 3_000 : 15_000
   })
 
@@ -723,7 +806,7 @@ function WorkerLogPanel({ task }) {
         ref: scrollRef,
         children:
           isLoading && !log
-            ? jsx('div', { className: 'grid h-full place-items-center', children: jsx(Loader) })
+            ? jsx('div', { className: 'grid h-full place-items-center', children: jsx(Loader, {}) })
             : error
               ? jsx(ErrorState, { description: errText(error), title: 'Log konnte nicht geladen werden' })
               : log && log.exists === false
@@ -1368,10 +1451,607 @@ function TaskGroup({ label, now, onSelect, selectedId, tasks }) {
   })
 }
 
+// ── the board switcher ───────────────────────────────────────────────────────
+// The core Kanban page's board switcher, the same dropdown with the same
+// actions, projected into the workspace page header while Kanban+ is mounted:
+// separate boards are the point, so switching, creating, scoping, transferring
+// and archiving one must work from here exactly as it does from the core page.
+
+/** Mirrors `kanban_db.DEFAULT_BOARD` — the board that always exists. */
+const DEFAULT_BOARD = 'default'
+const NO_PROJECT = '__none__'
+const FIELD_LABEL = 'text-[0.62rem] font-semibold uppercase tracking-[0.14em] text-(--ui-text-quaternary)'
+const ARCHIVE_FILTERS = [{ extensions: ['tar.gz', 'tgz'], name: 'Hermes-Board' }]
+
+/** The slug `boards create` makes of a display name. */
+export function boardSlugFromName(name) {
+  return String(name ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+}
+
+/** What the switcher's trigger shows: display name, else slug, else the word. */
+export function boardLabel(boards, slug) {
+  const current = boards?.boards?.find(meta => meta.slug === (slug || boards.current))
+
+  return current?.name || current?.slug || 'Board'
+}
+
+/** Board scope = a first-class Hermes project. Its primary repo becomes the
+ *  board's default workspace root; new tasks inherit it as a worktree with a
+ *  deterministic branch. "No project" falls back to scratch sandboxes. */
+function ProjectPicker({ onChange, value }) {
+  const { data } = useQuery({ queryFn: fetchProjects, queryKey: PROJECTS_KEY, staleTime: 30_000 })
+  const projects = data?.projects ?? []
+
+  return jsxs('label', {
+    className: 'flex flex-col gap-1',
+    children: [
+      jsx('span', { className: FIELD_LABEL, children: 'Projekt' }),
+      jsxs(Select, {
+        onValueChange: id => onChange(id === NO_PROJECT ? '' : id),
+        value: value || NO_PROJECT,
+        children: [
+          jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+          jsxs(SelectContent, {
+            children: [
+              jsx(SelectItem, { value: NO_PROJECT, children: 'Kein Projekt (Scratch-Sandboxes)' }),
+              projects.map(project => jsx(SelectItem, { value: project.id, children: project.name }, project.id))
+            ]
+          })
+        ]
+      }),
+      jsxs('span', {
+        className: 'text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)',
+        children: [
+          'Das primäre Repo des Projekts wird zum Arbeitsverzeichnis des Boards. Projekte verwaltest du mit ',
+          jsx('span', { className: 'font-mono', children: 'hermes project' }),
+          '.'
+        ]
+      })
+    ]
+  })
+}
+
+/** Every board write ends the same way: refresh the switcher's list and let
+ *  the caller finish, or surface the error and leave the dialog open. */
+function useBoardWrite(mutationFn, onDone) {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn,
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: result => {
+      void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+      onDone(result)
+    }
+  })
+}
+
+/** Shared chrome for the board dialogs — same width, same Abbrechen/confirm pair. */
+function BoardDialog({ children, confirmLabel, disabled, onClose, onConfirm, open, title }) {
+  return jsx(Dialog, {
+    onOpenChange: next => !next && onClose(),
+    open,
+    children: jsxs(DialogContent, {
+      className: 'max-w-md',
+      children: [
+        jsx(DialogHeader, { children: jsx(DialogTitle, { children: title }) }),
+        jsx('div', { className: 'flex flex-col gap-3', children }),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { onClick: onClose, variant: 'text', children: 'Abbrechen' }),
+            jsx(Button, { disabled, onClick: onConfirm, children: confirmLabel })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+/** Display name, with the slug it maps to shown underneath. */
+function BoardNameField({ onChange, onEnter, slug, value }) {
+  return jsxs('label', {
+    className: 'flex flex-col gap-1',
+    children: [
+      jsx('span', { className: FIELD_LABEL, children: 'Name' }),
+      jsx(Input, {
+        autoFocus: true,
+        onChange: event => onChange(event.target.value),
+        onKeyDown: event => isSubmitEnter(event) && onEnter(),
+        placeholder: 'Board-Name',
+        value
+      }),
+      slug ? jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: `Slug: ${slug}` }) : null
+    ]
+  })
+}
+
+function NewBoardDialog({ onClose, open }) {
+  const [name, setName] = useState('')
+  const [project, setProject] = useState('')
+  const slug = boardSlugFromName(name)
+
+  useEffect(() => {
+    if (open) {
+      setName('')
+      setProject('')
+    }
+  }, [open])
+
+  const create = useBoardWrite(
+    () => createBoard(slug, name.trim(), project || undefined),
+    result => {
+      $boardSlug.set(result.board.slug)
+      onClose()
+    }
+  )
+
+  return jsxs(BoardDialog, {
+    confirmLabel: 'Board erstellen',
+    disabled: !slug || create.isPending,
+    onClose,
+    onConfirm: () => create.mutate(),
+    open,
+    title: 'Neues Board',
+    children: [
+      // Enter submits only while the scope is untouched — once a project is
+      // picked the choice is worth a deliberate click.
+      jsx(BoardNameField, {
+        onChange: setName,
+        onEnter: () => slug && !project && create.mutate(),
+        slug,
+        value: name
+      }),
+      jsx(ProjectPicker, { onChange: setProject, value: project })
+    ]
+  })
+}
+
+/** Name-only edit, the way projects rename. The slug is immutable — it is the
+ *  board's directory name — so this touches the display name alone. */
+function RenameBoardDialog({ board, onClose }) {
+  const [name, setName] = useState('')
+  // The dialog stays mounted while closed, so `board` is null most of the
+  // time; resolve the slug here rather than inside the mutation callback.
+  const slug = board?.slug ?? ''
+
+  useEffect(() => {
+    if (board) {
+      setName(board.name || board.slug)
+    }
+  }, [board])
+
+  const save = useBoardWrite(() => updateBoard(slug, { name: name.trim() }), onClose)
+  const disabled = !name.trim() || save.isPending
+
+  return jsx(BoardDialog, {
+    confirmLabel: 'Speichern',
+    disabled,
+    onClose,
+    onConfirm: () => save.mutate(),
+    open: Boolean(board),
+    title: 'Board umbenennen',
+    children: jsx(BoardNameField, {
+      onChange: setName,
+      onEnter: () => !disabled && save.mutate(),
+      slug,
+      value: name
+    })
+  })
+}
+
+function BoardSettingsDialog({ board, onClose }) {
+  const [project, setProject] = useState('')
+  // Null while closed — see RenameBoardDialog.
+  const slug = board?.slug ?? ''
+
+  useEffect(() => {
+    if (board) {
+      setProject(board.project_id || '')
+    }
+  }, [board])
+
+  // The name lives in the rename dialog; '' clears the scope, which also drops
+  // the mirrored default_workdir on the backend.
+  const save = useBoardWrite(() => updateBoard(slug, { project_id: project }), onClose)
+
+  return jsx(BoardDialog, {
+    confirmLabel: 'Speichern',
+    disabled: save.isPending,
+    onClose,
+    onConfirm: () => save.mutate(),
+    open: Boolean(board),
+    title: board ? `Board-Einstellungen — ${board.name || board.slug}` : 'Einstellungen…',
+    children: jsx(ProjectPicker, { onChange: setProject, value: project })
+  })
+}
+
+// Board transfer exchanges filesystem paths, not bytes: the picker runs on the
+// machine hosting the backend, so the backend reads and writes the archive.
+
+async function runExportBoardFlow(os, slug) {
+  const output = await os.pickSavePath({
+    defaultPath: `${slug}.tar.gz`,
+    filters: ARCHIVE_FILTERS,
+    title: 'Board exportieren…'
+  })
+
+  if (!output) {
+    return null
+  }
+
+  try {
+    const result = await exportBoard(slug, output)
+
+    host.notify({ kind: 'success', message: `Board nach ${result.archive} exportiert` })
+
+    return result.archive
+  } catch (error) {
+    host.notify({ kind: 'error', message: errText(error) })
+
+    return null
+  }
+}
+
+async function runImportBoardFlow(os) {
+  const archive = await os.pickOpenPath({ filters: ARCHIVE_FILTERS, title: 'Board importieren…' })
+
+  if (!archive) {
+    return null
+  }
+
+  try {
+    const result = await importBoard(archive)
+
+    host.notify({ kind: 'success', message: `${result.name} importiert` })
+
+    // The slug auto-suffixes on collision, and warnings cover tasks parked for
+    // an unresolvable workspace — both change what the user sees on the board
+    // they just opened, so neither is allowed to pass silently.
+    if (result.renamed) {
+      host.notify({ kind: 'info', message: `Name war vergeben — als ${result.board} importiert` })
+    }
+
+    for (const warning of result.warnings ?? []) {
+      host.notify({ kind: 'warning', message: warning })
+    }
+
+    return result.board
+  } catch (error) {
+    host.notify({ kind: 'error', message: errText(error) })
+
+    return null
+  }
+}
+
+function BoardSwitcher() {
+  const qc = useQueryClient()
+  const slug = useValue($boardSlug)
+  const { data: boards } = useQuery({ queryFn: fetchBoards, queryKey: BOARDS_KEY, staleTime: 30_000 })
+  const [adding, setAdding] = useState(false)
+  const [settingsFor, setSettingsFor] = useState(null)
+  const [renameFor, setRenameFor] = useState(null)
+  const [deleteFor, setDeleteFor] = useState(null)
+
+  // Archive rather than erase, so a mis-click stays recoverable. The backend
+  // reverts the active board to default; drop our override to follow it.
+  const confirmDelete = async target => {
+    const { result } = await deleteBoard(target.slug)
+
+    $boardSlug.set('')
+    void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+    host.notify({ kind: 'success', message: `Board nach ${result.new_path} archiviert` })
+  }
+
+  const runExport = async target => {
+    const os = pluginOs()
+
+    if (os) {
+      await runExportBoardFlow(os, target)
+    }
+  }
+
+  const runImport = async () => {
+    const os = pluginOs()
+
+    if (!os) {
+      return
+    }
+
+    const imported = await runImportBoardFlow(os)
+
+    if (imported) {
+      $boardSlug.set(imported)
+      void qc.invalidateQueries({ queryKey: BOARDS_KEY })
+    }
+  }
+
+  if (!boards) {
+    return null
+  }
+
+  const currentSlug = slug || boards.current
+  const current = boards.boards.find(meta => meta.slug === currentSlug)
+  const label = boardLabel(boards, slug)
+
+  return jsxs(Fragment, {
+    children: [
+      jsxs(DropdownMenu, {
+        children: [
+          jsx(Tip, {
+            label: 'Board wechseln',
+            children: jsx(DropdownMenuTrigger, {
+              asChild: true,
+              children: jsxs(Button, {
+                'aria-label': `Board: ${label}`,
+                className: 'h-full min-w-0 max-w-full gap-1.5 px-2',
+                size: 'sm',
+                variant: 'ghost',
+                children: [
+                  jsx(Codicon, { className: 'shrink-0 text-(--ui-text-tertiary)', name: 'project', size: '0.8125rem' }),
+                  jsx('span', {
+                    className: 'shrink-0 text-[0.6875rem] font-medium text-(--ui-text-tertiary)',
+                    children: 'Board'
+                  }),
+                  jsx('span', { className: 'min-w-0 flex-1 truncate text-[0.75rem] font-medium leading-none', children: label }),
+                  typeof current?.total === 'number'
+                    ? jsx('span', {
+                        className: 'text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
+                        children: current.total
+                      })
+                    : null,
+                  jsx(Codicon, { className: 'shrink-0 text-(--ui-text-tertiary)', name: 'chevron-down', size: '0.8125rem' })
+                ]
+              })
+            })
+          }),
+          jsxs(DropdownMenuContent, {
+            align: 'center',
+            children: [
+              boards.boards.map(meta =>
+                jsxs(
+                  DropdownMenuItem,
+                  {
+                    onSelect: () => $boardSlug.set(meta.slug === boards.current ? '' : meta.slug),
+                    children: [
+                      // This plugin's own addition to the core switcher: a
+                      // board whose dispatch is stopped says so in the list.
+                      meta.stopped ? jsx(StatusDot, { tone: 'bad' }) : null,
+                      meta.name || meta.slug,
+                      typeof meta.total === 'number'
+                        ? jsx('span', {
+                            className: 'text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
+                            children: meta.total
+                          })
+                        : null,
+                      meta.slug === currentSlug ? jsx(Codicon, { className: 'ml-auto', name: 'check', size: '0.8rem' }) : null
+                    ]
+                  },
+                  meta.slug
+                )
+              ),
+              jsx(DropdownMenuSeparator, {}),
+              current
+                ? jsxs(Fragment, {
+                    children: [
+                      jsxs(DropdownMenuItem, {
+                        onSelect: () => setRenameFor(current),
+                        children: [jsx(Codicon, { name: 'edit', size: '0.8rem' }), 'Umbenennen…']
+                      }),
+                      jsxs(DropdownMenuItem, {
+                        onSelect: () => setSettingsFor(current),
+                        children: [jsx(Codicon, { name: 'settings-gear', size: '0.8rem' }), 'Einstellungen…']
+                      })
+                    ]
+                  })
+                : null,
+              jsxs(DropdownMenuItem, {
+                onSelect: () => setAdding(true),
+                children: [jsx(Codicon, { name: 'add', size: '0.8rem' }), 'Neues Board…']
+              }),
+              jsx(DropdownMenuSeparator, {}),
+              current
+                ? jsxs(DropdownMenuItem, {
+                    onSelect: () => void runExport(current.slug),
+                    children: [jsx(Codicon, { name: 'package', size: '0.8rem' }), 'Exportieren…']
+                  })
+                : null,
+              jsxs(DropdownMenuItem, {
+                onSelect: () => void runImport(),
+                children: [jsx(Codicon, { name: 'cloud-download', size: '0.8rem' }), 'Importieren…']
+              }),
+              // `default` is the fallback every board reverts to — the backend
+              // refuses to remove it, so it never offers the action.
+              current && current.slug !== DEFAULT_BOARD
+                ? jsxs(Fragment, {
+                    children: [
+                      jsx(DropdownMenuSeparator, {}),
+                      jsxs(DropdownMenuItem, {
+                        onSelect: () => setDeleteFor(current),
+                        variant: 'destructive',
+                        children: [jsx(Codicon, { name: 'trash', size: '0.8rem' }), 'Löschen']
+                      })
+                    ]
+                  })
+                : null
+            ]
+          })
+        ]
+      }),
+      jsx(NewBoardDialog, { onClose: () => setAdding(false), open: adding }),
+      jsx(RenameBoardDialog, { board: renameFor, onClose: () => setRenameFor(null) }),
+      jsx(BoardSettingsDialog, { board: settingsFor, onClose: () => setSettingsFor(null) }),
+      jsx(ConfirmDialog, {
+        confirmLabel: 'Löschen',
+        description:
+          'Das Board wird archiviert, nicht gelöscht — Tasks und Anhänge bleiben auf der Platte und lassen sich wiederherstellen.',
+        destructive: true,
+        onClose: () => setDeleteFor(null),
+        onConfirm: () => confirmDelete(deleteFor),
+        open: Boolean(deleteFor),
+        title: deleteFor ? `„${deleteFor.name || deleteFor.slug}" löschen?` : 'Löschen'
+      })
+    ]
+  })
+}
+
+// ── the board columns ────────────────────────────────────────────────────────
+// The lanes core's Kanban page draws, in core's order and with its icons and
+// tones (`COLUMN_META` in the core plugin's types.ts). Kanban+ is a board page:
+// a card has to be visible HERE, not only in the running/recent list beside the
+// log. Cards select the task the log and the context meter below them show.
+
+const COLUMN_META = {
+  triage: { codicon: 'inbox', label: 'Triage', tone: 'var(--ui-text-tertiary)' },
+  todo: { codicon: 'circle-outline', label: 'Todo', tone: 'var(--ui-text-secondary)' },
+  scheduled: { codicon: 'watch', label: 'Geplant', tone: '#a78bfa' },
+  ready: { codicon: 'play-circle', label: 'Ready', tone: '#60a5fa' },
+  running: { codicon: 'sync', label: 'Läuft', tone: '#34d399' },
+  blocked: { codicon: 'error', label: 'Blockiert', tone: '#f87171' },
+  review: { codicon: 'eye', label: 'Review', tone: '#fbbf24' },
+  done: { codicon: 'pass', label: 'Fertig', tone: 'var(--ui-text-tertiary)' },
+  archived: { codicon: 'archive', label: 'Archiviert', tone: 'var(--ui-text-quaternary)' }
+}
+
+/** Icon, label and tone for a lane; an unknown status keeps its own id. */
+export function columnMeta(name) {
+  return COLUMN_META[name] ?? { codicon: 'circle-outline', label: String(name ?? ''), tone: 'var(--ui-text-secondary)' }
+}
+
+function BoardCard({ now, onSelect, selected, task }) {
+  const running = task.status === 'running'
+  const startedMs = parseMs(task.started_at)
+  const meta = []
+
+  if (task.assignee) {
+    meta.push(task.assignee)
+  }
+
+  if (running && startedMs !== null) {
+    meta.push(formatElapsed(startedMs, now))
+  }
+
+  if (task.progress?.total) {
+    meta.push(`${task.progress.done}/${task.progress.total}`)
+  }
+
+  if (task.comment_count > 0) {
+    meta.push(`${task.comment_count} ${task.comment_count === 1 ? 'Kommentar' : 'Kommentare'}`)
+  }
+
+  return jsxs('button', {
+    className: cn(
+      'flex w-full flex-col gap-1 rounded-md border px-2 py-1.5 text-left transition-colors',
+      selected
+        ? 'border-(--color-primary) bg-(--ui-bg-tertiary)'
+        : 'border-(--ui-stroke-tertiary) hover:bg-(--ui-bg-tertiary)'
+    ),
+    onClick: () => onSelect(task.id),
+    title: task.title,
+    type: 'button',
+    children: [
+      jsx('span', { className: 'line-clamp-2 text-[0.75rem] leading-snug text-foreground', children: task.title }),
+      meta.length > 0
+        ? jsx('span', {
+            className: 'truncate text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
+            children: meta.join(' · ')
+          })
+        : null
+    ]
+  })
+}
+
+function BoardColumn({ column, now, onSelect, selectedId }) {
+  const meta = columnMeta(column.name)
+  const tasks = column.tasks ?? []
+
+  return jsxs('section', {
+    className: 'flex h-full w-56 shrink-0 flex-col gap-1.5',
+    children: [
+      jsxs('div', {
+        className: 'flex shrink-0 items-center gap-1.5 px-0.5',
+        children: [
+          // The tone rides on the wrapper: codicons are glyphs and take
+          // `currentColor`, so this colors the icon without a style prop on it.
+          jsx('span', {
+            className: 'inline-flex',
+            style: { color: meta.tone },
+            children: jsx(Codicon, { name: meta.codicon, size: '0.8rem' })
+          }),
+          jsx('span', {
+            className: 'text-[0.6875rem] font-semibold tracking-wide text-(--ui-text-secondary) uppercase',
+            children: meta.label
+          }),
+          jsx('span', {
+            className:
+              'rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)',
+            children: tasks.length
+          })
+        ]
+      }),
+      jsx('div', {
+        className: 'flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto pb-2',
+        children:
+          tasks.length === 0
+            ? jsx('span', { className: 'px-0.5 text-[0.6875rem] text-(--ui-text-quaternary)', children: '—' })
+            : tasks.map(task =>
+                jsx(BoardCard, { now, onSelect, selected: task.id === selectedId, task }, task.id)
+              )
+      })
+    ]
+  })
+}
+
+/** The whole board, one lane per status, scrolling sideways when it is wider
+ *  than the page. The page owns the query — it needs the same cards to resolve
+ *  a selection the running/recent list never carried. */
+function BoardColumns({ board, error, isLoading, now, onSelect, selectedId }) {
+  if (error) {
+    return jsx('div', {
+      className: 'grid h-full place-items-center p-4',
+      children: jsx(ErrorState, { description: errText(error), title: 'Board konnte nicht geladen werden' })
+    })
+  }
+
+  if (isLoading && !board) {
+    return jsx('div', { className: 'grid h-full place-items-center', children: jsx(Loader, {}) })
+  }
+
+  const columns = board?.columns ?? []
+
+  if (columns.every(column => (column.tasks?.length ?? 0) === 0)) {
+    return jsx('div', {
+      className: 'grid h-full place-items-center p-4',
+      children: jsx(EmptyState, {
+        description: 'Dieses Board hat noch keine Tasks. Lege einen an — auf der Kanban-Seite oder mit `hermes kanban add`.',
+        title: 'Leeres Board'
+      })
+    })
+  }
+
+  return jsx('div', {
+    className: 'flex h-full min-h-0 gap-3 overflow-x-auto px-4 py-3',
+    'data-slot': 'kanban-plus-columns',
+    children: columns.map(column =>
+      jsx(BoardColumn, { column, now, onSelect, selectedId }, column.name)
+    )
+  })
+}
+
 // ── the page ─────────────────────────────────────────────────────────────────
 
 function KanbanPlusPage() {
-  const [selectedId, setSelectedId] = useState(() => readSelectedTask())
+  const slug = useValue($boardSlug)
+  const [selectedId, setSelectedId] = useState(() => readSelectedTask($boardSlug.get()))
+  // Which board already got its one automatic "land on a running task".
+  const autoLanded = useRef('')
+
+  // A task id belongs to the board it came from, so a switch re-reads THAT
+  // board's remembered selection instead of pointing at a task it never had.
+  useEffect(() => setSelectedId(readSelectedTask(slug)), [slug])
 
   const {
     data: state,
@@ -1379,13 +2059,23 @@ function KanbanPlusPage() {
     isLoading: stateLoading
   } = useQuery({
     queryFn: fetchState,
-    queryKey: STATE_KEY,
+    queryKey: stateKey(slug),
     refetchInterval: 10_000
   })
 
   const { data: tasks } = useQuery({
     queryFn: fetchTasks,
-    queryKey: TASKS_KEY,
+    queryKey: tasksKey(slug),
+    refetchInterval: 5_000
+  })
+
+  const {
+    data: board,
+    error: boardError,
+    isLoading: boardLoading
+  } = useQuery({
+    queryFn: fetchBoard,
+    queryKey: boardKey(slug),
     refetchInterval: 5_000
   })
 
@@ -1397,27 +2087,33 @@ function KanbanPlusPage() {
 
   const now = Date.now()
 
-  const selected = useMemo(
-    () => [...running, ...recent].find(task => task.id === selectedId) ?? null,
-    [recent, running, selectedId]
-  )
+  // A card can sit in a lane the running/recent list does not reach (an old
+  // Todo, say), and picking one still has to open its log.
+  const selected = useMemo(() => {
+    const cards = (board?.columns ?? []).flatMap(column => column.tasks ?? [])
+
+    return [...running, ...recent, ...cards].find(task => task.id === selectedId) ?? null
+  }, [board, recent, running, selectedId])
 
   const select = id => {
     setSelectedId(id)
-    writeSelectedTask(id)
+    writeSelectedTask(slug, id)
   }
 
   // Nothing resolved (first open, or a remembered id whose task was pruned) and
   // something IS running: land on it rather than leaving the panel on a dead
   // selection. Only runs once the first task payload arrived — before that an
-  // empty `running` says nothing about whether the id is still valid.
+  // empty `running` says nothing about whether the id is still valid. Once per
+  // board, so closing the log keeps the lanes full height instead of having the
+  // next poll re-open it.
   useEffect(() => {
-    if (tasks && !selected && running.length > 0) {
+    if (tasks && !selected && running.length > 0 && autoLanded.current !== slug) {
+      autoLanded.current = slug
       select(running[0].id)
     }
     // `select` is stable enough (it only wraps two setters) to leave out.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [running, selected, tasks])
+  }, [running, selected, slug, tasks])
 
   if (stateError) {
     return jsx('div', {
@@ -1427,7 +2123,7 @@ function KanbanPlusPage() {
   }
 
   if (stateLoading && !state) {
-    return jsx('div', { className: 'grid h-full place-items-center', children: jsx(Loader) })
+    return jsx('div', { className: 'grid h-full place-items-center', children: jsx(Loader, {}) })
   }
 
   const stopped = Boolean(state?.stopped)
@@ -1438,10 +2134,16 @@ function KanbanPlusPage() {
     className: 'flex h-full min-h-0 flex-col bg-(--ui-surface-background)',
     'data-slot': 'kanban-plus-page',
     children: [
+      // Page-owned header chrome: exists exactly while this page is mounted.
+      jsx(Contribute, {
+        area: WORKSPACE_PAGE_HEADER_AREA,
+        id: 'kanban-plus:board-switcher',
+        children: jsx(BoardSwitcher, {})
+      }),
       jsxs('header', {
         className: 'flex shrink-0 flex-wrap items-center gap-2 px-4 pt-3 pb-2',
         children: [
-          jsx('h1', { className: 'text-sm font-semibold text-foreground', children: state?.board ?? 'Kanban+' }),
+          jsx('h1', { className: 'text-sm font-semibold text-foreground', children: 'Kanban+' }),
           jsxs(Badge, {
             size: 'xs',
             variant: stopped ? 'destructive' : 'success',
@@ -1490,15 +2192,41 @@ function KanbanPlusPage() {
                     ]
                   })
           }),
-          selected
-            ? jsx(WorkerLogPanel, { task: selected }, selected.id)
-            : jsx('div', {
-                className: 'grid min-h-0 flex-1 place-items-center',
-                children: jsx(EmptyState, {
-                  description: 'Task links auswählen, um sein Worker-Log zu sehen.',
-                  title: 'Kein Task ausgewählt'
+          // The lanes own the page; the log opens underneath them for the card
+          // (or list row) the reader picked, and gives the space back on close.
+          jsxs('div', {
+            className: 'flex min-h-0 min-w-0 flex-1 flex-col',
+            children: [
+              jsx('div', {
+                className: 'min-h-0 flex-1',
+                children: jsx(BoardColumns, {
+                  board,
+                  error: boardError,
+                  isLoading: boardLoading,
+                  now,
+                  onSelect: select,
+                  selectedId
                 })
-              })
+              }),
+              selected
+                ? jsxs('div', {
+                    className: 'flex h-2/5 min-h-0 shrink-0 flex-col border-t border-(--ui-stroke-tertiary)',
+                    children: [
+                      jsx(WorkerLogPanel, { task: selected }, selected.id),
+                      jsx('div', {
+                        className: 'shrink-0 border-t border-(--ui-stroke-tertiary) px-4 py-1 text-right',
+                        children: jsx(Button, {
+                          onClick: () => select(null),
+                          size: 'sm',
+                          variant: 'text',
+                          children: 'Log schließen'
+                        })
+                      })
+                    ]
+                  })
+                : null
+            ]
+          })
         ]
       })
     ]
@@ -1509,10 +2237,11 @@ function KanbanPlusPage() {
 
 function StatusbarPill() {
   const qc = useQueryClient()
+  const slug = useValue($boardSlug)
 
   const { data: state } = useQuery({
     queryFn: fetchState,
-    queryKey: STATE_KEY,
+    queryKey: stateKey(slug),
     refetchInterval: 15_000
   })
 
@@ -1678,10 +2407,22 @@ const plugin = {
     'Board-Kontrolle für Kanban: Stop/Start, Limit für parallele Runs, Worker-Log mit Zeitspalte und Kontext-Anzeige.',
   register(ctx) {
     restCall = ctx.rest
-    // Disk plugins hot-reload on every save; drop the door so a stale closure
+    osDoor = ctx.os
+
+    // The picked board is a setting, not a session detail: hydrate it from the
+    // plugin's own storage and keep that storage in sync with the atom.
+    const storage = ctx.storage
+
+    $boardSlug.set(storage?.get(BOARD_SLUG_KEY, '') ?? '')
+
+    const unlisten = storage ? $boardSlug.listen(value => storage.set(BOARD_SLUG_KEY, value)) : () => {}
+
+    // Disk plugins hot-reload on every save; drop the doors so a stale closure
     // can never keep calling through a context that was torn down.
     ctx.onDispose(() => {
+      unlisten()
       restCall = null
+      osDoor = null
     })
 
     ctx.registerMany([

@@ -9,10 +9,12 @@ import sys
 from . import board_control, board_model, core, dispatch_guard, worker_context
 
 
-def _conn():
+def _conn(board: str | None = None):
+    """Connection to ``--board``'s own database — separate boards are separate
+    databases, so the current one must never answer for the chosen one."""
     from hermes_cli import kanban_db_connect as kbc
 
-    return kbc.connect_closing()
+    return kbc.connect_closing(board=board)
 
 
 def _board(args: argparse.Namespace) -> str | None:
@@ -42,15 +44,17 @@ def _running_count(conn) -> int:
 
 
 def _cmd_status(args) -> int:
-    with _conn() as conn:
-        _print_state(board_control.get_state(_board(args)), dispatch_guard.effective_cap(),
+    board = _board(args)
+    with _conn(board) as conn:
+        _print_state(board_control.get_state(board), dispatch_guard.effective_cap(),
                      _running_count(conn), bool(getattr(args, "json", False)))
     return 0
 
 
 def _cmd_stop(args) -> int:
-    with _conn() as conn:
-        result = board_control.stop(conn, board=_board(args), reason=getattr(args, "reason", None))
+    board = _board(args)
+    with _conn(board) as conn:
+        result = board_control.stop(conn, board=board, reason=getattr(args, "reason", None))
     print(f"Board {result.state.board} stopped.")
     if result.reclaimed:
         print(f"  reclaimed: {', '.join(result.reclaimed)}")
@@ -65,7 +69,7 @@ def _cmd_start(args) -> int:
     spawned: list = []
     try:
         kbd = core.kanban_dispatch()
-        with _conn() as conn:
+        with _conn(board) as conn:
             spawned = [entry[0] for entry in kbd.dispatch_once(
                 conn, board=board, max_in_progress=dispatch_guard.effective_cap()).spawned]
     except Exception:
