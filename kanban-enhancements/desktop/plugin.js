@@ -546,6 +546,25 @@ function formatStamp(value) {
 }
 
 /**
+ * The one failure this plugin can diagnose on sight. Both halves ship in the
+ * same package, so the page never asks its own backend for a method that
+ * backend does not have — unless the two are not the same version. Installing
+ * REPLACES the directory the backend was imported from while the gateway keeps
+ * serving the module it already loaded, so a page reloaded from the new files
+ * talks to the old router and gets a bare `Method Not Allowed` for an endpoint
+ * that plainly exists on disk. The version row above the lanes says the same
+ * thing ("installiert — Gateway neu starten"); this says it where it bit.
+ */
+const STALE_BACKEND =
+  'Das Backend ist älter als diese Oberfläche — der Gateway serviert noch die vorherige Version von Kanban+. ' +
+  'Starte ihn neu (`hermes gateway restart`), dann funktioniert die Aktion.'
+
+/** True for the REST bridge's way of saying 405, prefix or plain. */
+function isMethodNotAllowed(raw) {
+  return /^\s*405\b/.test(raw) || raw.includes('Method Not Allowed')
+}
+
+/**
  * A message worth showing. The desktop REST bridge rejects with
  * `Error('409: {"detail":"…"}')`, and the raw form buries the one sentence that
  * says WHY a move was refused ("blocked by parent …") behind a status code and
@@ -556,6 +575,11 @@ export function errText(err) {
 
   if (!raw) {
     return 'Unbekannter Fehler'
+  }
+
+  // Before the detail is unwrapped: a 405's detail is the useless half of it.
+  if (isMethodNotAllowed(raw)) {
+    return STALE_BACKEND
   }
 
   const brace = raw.indexOf('{')

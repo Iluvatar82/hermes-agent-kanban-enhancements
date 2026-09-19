@@ -438,6 +438,21 @@ describe('errText', () => {
     assert.equal(plugin.errText(new Error('500: not json {')), '500: not json {')
     assert.equal(plugin.errText(undefined), 'Unbekannter Fehler')
   })
+
+  it('reads a 405 as the gateway serving an older backend than this page', () => {
+    // Both halves ship together, so the page cannot ask its own backend for a
+    // method that backend lacks — unless an update replaced the files under a
+    // gateway that had already imported the previous module. `Method Not
+    // Allowed` alone sends the reader looking for a bug that is not there.
+    for (const raw of ['405: {"detail":"Method Not Allowed"}', 'Method Not Allowed']) {
+      assert.match(plugin.errText(new Error(raw)), /Gateway serviert noch die vorherige Version/)
+      assert.match(plugin.errText(new Error(raw)), /hermes gateway restart/)
+    }
+  })
+
+  it('does not read a 405 into a status that merely contains one', () => {
+    assert.equal(plugin.errText(new Error('500: {"detail":"worker 405 exited"}')), 'worker 405 exited')
+  })
 })
 
 describe('shortId', () => {
