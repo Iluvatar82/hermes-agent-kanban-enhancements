@@ -416,3 +416,91 @@ def test_the_task_fields_the_detail_view_reads_still_exist(pkg):
     assert {"body", "result", "model_override", "provider_override", "workspace_kind",
             "workspace_path", "branch_name", "created_by", "worker_pid", "last_failure_error",
             "consecutive_failures"} <= fields
+
+
+# --- Updating this plugin from inside it ------------------------------------
+
+
+@pytest.fixture
+def no_probe(api, pkg, monkeypatch):
+    """Never touch the network from a test; the probe has its own tests."""
+    monkeypatch.setattr(pkg.self_update, "fetch_latest_version", lambda source, **kw: ("0.9.9", ""))
+    monkeypatch.setattr(pkg.self_update, "installed_source", lambda: "https://github.com/o/r.git#sub")
+    return pkg
+
+
+def test_version_reports_running_installed_and_latest(client, no_probe, api):
+    body = client.get("/api/plugins/kanban-enhancements/version").json()
+
+    assert body["running"] == api._PLUGIN_VERSION
+    assert body["installed"] == api._package().self_update.installed_version()
+    assert body["latest"] == "0.9.9" and body["update_available"] is True
+    assert body["source"] == "https://github.com/o/r.git#sub"
+    assert body["restart_required"] is False and body["check_error"] is None
+
+
+def test_version_can_skip_the_network_probe(client, no_probe):
+    body = client.get("/api/plugins/kanban-enhancements/version?check=false").json()
+
+    assert body["latest"] is None and body["update_available"] is False
+
+
+def test_the_update_check_setting_turns_the_probe_off(client, no_probe, pkg):
+    pkg.core.set_settings({"update_check": False})
+    try:
+        assert client.get("/api/plugins/kanban-enhancements/version").json()["latest"] is None
+    finally:
+        pkg.core.set_settings({})
+
+
+def test_a_newer_version_on_disk_than_in_memory_asks_for_a_restart(client, no_probe, pkg, monkeypatch):
+    """The update landed but the gateway still serves the old module — the one
+    state the page must not silently swallow."""
+    monkeypatch.setattr(pkg.self_update, "installed_version", lambda: "99.0.0")
+
+    body = client.get("/api/plugins/kanban-enhancements/version?check=false").json()
+    assert body["restart_required"] is True and body["installed"] == "99.0.0"
+
+
+def test_update_uses_the_recorded_source_never_the_request(client, no_probe, pkg, monkeypatch):
+    calls = []
+
+    def _install(source, ref):
+        calls.append((source, ref))
+        return {"ok": True, "installed_version": "0.9.9"}
+
+    monkeypatch.setattr(pkg.self_update, "install", _install)
+
+    body = client.post("/api/plugins/kanban-enhancements/update", json={"source": "https://evil.example/x.git"})
+
+    assert body.status_code == 200 and body.json()["ok"] is True
+    # The bogus `source` in the body is ignored; the recorded one is used.
+    assert calls == [("https://github.com/o/r.git#sub", None)]
+
+
+def test_update_passes_a_pin_through_and_refuses_anything_but_a_sha(client, no_probe, pkg, monkeypatch):
+    sha = "e6b17af599f98d1605b4f216878250bc734388da"
+    calls = []
+    monkeypatch.setattr(pkg.self_update, "install",
+                        lambda source, ref: calls.append(ref) or {"ok": True, "installed_version": "0.9.9"})
+
+    assert client.post("/api/plugins/kanban-enhancements/update", json={"ref": sha}).status_code == 200
+    assert calls == [sha]
+
+    refused = client.post("/api/plugins/kanban-enhancements/update", json={"ref": "main"})
+    assert refused.status_code == 400 and "40-character" in refused.json()["detail"]
+
+
+def test_an_installer_refusal_is_reported_not_swallowed(client, no_probe, pkg, monkeypatch):
+    monkeypatch.setattr(pkg.self_update, "install",
+                        lambda source, ref: {"ok": False, "error": "scan blocked: suspicious file"})
+
+    answer = client.post("/api/plugins/kanban-enhancements/update", json={})
+    assert answer.status_code == 502 and "scan blocked" in answer.json()["detail"]
+
+
+def test_update_says_so_when_this_hermes_has_no_installer(client, no_probe, pkg, monkeypatch):
+    monkeypatch.setattr(pkg.self_update, "available", lambda: False)
+
+    answer = client.post("/api/plugins/kanban-enhancements/update", json={})
+    assert answer.status_code == 503 and "plugins install" in answer.json()["detail"]

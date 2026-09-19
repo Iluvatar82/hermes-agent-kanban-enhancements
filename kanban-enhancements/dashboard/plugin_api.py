@@ -31,6 +31,12 @@ _SYNTHETIC_NAME = "hermes_kanban_enhancements"
 
 router = APIRouter()
 
+#: The version of the code THIS PROCESS imported — deliberately a literal and
+#: not a read of plugin.yaml, because an update swaps that file while this
+#: module stays loaded and the difference is what "restart required" means.
+#: tests/test_manifest.py keeps it equal to the manifest.
+_PLUGIN_VERSION = "0.3.0"
+
 
 def _package():
     """The plugin package: the loader's own copy when it is already imported."""
@@ -48,6 +54,91 @@ def _package():
     sys.modules[_SYNTHETIC_NAME] = module
     spec.loader.exec_module(module)
     return module
+
+
+# --- Updating this plugin from inside it -------------------------------------
+# The desktop's own plugin surface can reinstall this plugin, but only one
+# profile at a time and only through a modal that never says an update exists —
+# its "update available" badge is catalog-only, and this plugin is a plain git
+# install. So Kanban+ answers the question itself: what is running, what is on
+# disk, what the source repository has, and one POST that closes the gap.
+#
+# The source is NEVER taken from the request. It comes from Hermes' own install
+# metadata (a fork updates from the fork), so this endpoint can only reinstall
+# THIS plugin from the place it already came from.
+
+
+class UpdateBody(BaseModel):
+    """``ref`` pins one immutable commit, exactly like ``--ref``; empty = the
+    source's default branch."""
+
+    ref: str | None = Field(None, max_length=64)
+
+
+def _version_payload(check: bool) -> dict[str, Any]:
+    pkg = _package()
+    source = pkg.self_update.installed_source()
+    installed = pkg.self_update.installed_version()
+    running = _PLUGIN_VERSION
+    latest, error = ("", "")
+    if check:
+        latest, error = pkg.self_update.fetch_latest_version(source)
+    return {
+        "running": running,
+        "installed": installed,
+        "latest": latest or None,
+        "source": source,
+        "can_update": pkg.self_update.available(),
+        "update_available": pkg.self_update.is_newer(latest, installed),
+        # On disk but not in memory: the update landed and the gateway is still
+        # serving the previous code.
+        "restart_required": bool(installed and running and installed != running),
+        "check_error": error or None,
+    }
+
+
+@router.get("/version")
+def get_version(check: bool = Query(True, description="Also ask the source repository for its version")):
+    """What is running, what is installed, and what the source repository has."""
+    pkg = _package()
+    # The setting only governs the automatic probe; an explicit `check=true` from
+    # the update button still asks.
+    wanted = check and bool(pkg.core.setting("update_check", True))
+    return _version_payload(wanted)
+
+
+@router.post("/update")
+def update_plugin(payload: UpdateBody | None = None):
+    """Reinstall this plugin from its own source, then report what landed.
+
+    Installing REPLACES the directory this module was imported from, so the
+    gateway keeps serving the old code until it restarts — ``restart_required``
+    in the response says so rather than leaving the caller to guess.
+    """
+    pkg = _package()
+    if not pkg.self_update.available():
+        raise HTTPException(
+            status_code=503,
+            detail="this Hermes does not expose hermes_cli.plugins_cmd.dashboard_install_plugin, "
+                   "so Kanban+ cannot update itself; use `hermes plugins install ... --force --enable`")
+    with _value_error_400():
+        ref = pkg.self_update.normalize_ref(payload.ref if payload else None)
+    source = pkg.self_update.installed_source()
+    with _errors_to_500("update failed"):
+        result = pkg.self_update.install(source, ref)
+    if not result.get("ok"):
+        # The installer reports a refusal (a blocked scan, a bad ref, a
+        # network failure) in its payload rather than by raising.
+        detail = str(result.get("error") or "the installer refused the update")
+        raise HTTPException(status_code=502, detail=detail)
+    installed = str(result.get("installed_version") or "")
+    return {
+        **_version_payload(False),
+        "ok": True,
+        "installed": installed,
+        "restart_required": bool(installed and installed != _PLUGIN_VERSION),
+        "warnings": result.get("warnings") or [],
+    }
 
 
 # --- Board plumbing ---------------------------------------------------------
@@ -141,7 +232,7 @@ def _state_payload(board: str | None) -> dict[str, Any]:
         "max_in_progress_set": explicit,
         "effective_max_in_progress": pkg.dispatch_guard.effective_cap(),
         "guard_active": pkg.dispatch_guard.is_installed(),
-        "plugin_version": "0.3.0",
+        "plugin_version": _PLUGIN_VERSION,
     }
 
 

@@ -158,6 +158,10 @@ const postComment = (id, body) =>
 
 // The board directory itself. `ctx.rest` cannot leave this plugin's namespace,
 // so these mirror core's own `/boards` endpoints rather than borrowing them.
+const VERSION_KEY = ['kanban-plus', 'version']
+const fetchVersion = (check = true) => api(`/version?check=${check ? 'true' : 'false'}`)
+const runUpdate = ref => api('/update', { method: 'POST', body: ref ? { ref } : {} })
+
 const fetchBoards = () => api('/boards')
 const fetchProjects = () => api('/projects')
 const createBoard = (slug, name, projectId) =>
@@ -1492,6 +1496,51 @@ function BoardModelField({ state }) {
   })
 }
 
+/**
+ * Which of the four things the update row has to say. Pure, because "is there
+ * an update" is the one bit of this feature a reader will actually rely on:
+ *
+ *   · `unavailable` — this Hermes has no installer we can call
+ *   · `restart`     — a newer version is ON DISK; the gateway still runs the old
+ *   · `available`   — the source repository has a newer version than is installed
+ *   · `current`     — nothing to do
+ *
+ * `restart` outranks `available`: telling someone to download 0.4.0 again when
+ * 0.4.0 is already sitting on their disk, unloaded, is the one genuinely
+ * confusing thing this row could do.
+ */
+export function updateState(version) {
+  if (!version) {
+    return 'current'
+  }
+
+  if (version.can_update === false) {
+    return 'unavailable'
+  }
+
+  if (version.restart_required) {
+    return 'restart'
+  }
+
+  return version.update_available ? 'available' : 'current'
+}
+
+/** `Kanban+ 0.3.0`, and what is running when that is not what is installed. */
+export function versionLabel(version) {
+  const installed = String(version?.installed ?? '').trim()
+  const running = String(version?.running ?? '').trim()
+
+  if (!installed && !running) {
+    return 'Kanban+'
+  }
+
+  if (installed && running && installed !== running) {
+    return `Kanban+ ${running} → ${installed}`
+  }
+
+  return `Kanban+ ${installed || running}`
+}
+
 /** A pinned model that the gateway does not actually patch in is a lie the page
  *  must not tell. Only an EXPLICIT `false` warns — an older backend omits the
  *  field entirely, and that is not evidence of breakage. */
@@ -1517,6 +1566,110 @@ function ModelPatchWarning({ state }) {
         : 'Board-Modell greift nicht für den Auto-Composer (Patch inaktiv) — Task-Runs nutzen es.'
 
   return jsx(WarningRow, { children: message })
+}
+
+/** Update this plugin from its own source: what is running, what is out there,
+ *  and one button that closes the gap. The install replaces the directory this
+ *  page's backend was imported from, so the gateway keeps serving the old code
+ *  until it restarts — the row says that instead of leaving it to be noticed. */
+function PluginUpdateField() {
+  const qc = useQueryClient()
+  const [confirming, setConfirming] = useState(false)
+
+  const { data, error, isFetching, refetch } = useQuery({
+    queryFn: () => fetchVersion(true),
+    queryKey: VERSION_KEY,
+    // A version probe is not worth a retry storm behind a firewall; the backend
+    // already answers with `check_error` rather than failing.
+    retry: false,
+    staleTime: 30 * 60_000
+  })
+
+  const update = useMutation({
+    mutationFn: () => runUpdate(),
+    onError: err => host.notifyError(err, 'Update fehlgeschlagen'),
+    onSuccess: result =>
+      host.notify({
+        kind: 'success',
+        message: result?.restart_required
+          ? `Kanban+ ${result.installed} installiert — Gateway neu starten, um es zu laden.`
+          : `Kanban+ ${result?.installed ?? ''} installiert.`
+      }),
+    onSettled: () => void qc.invalidateQueries({ queryKey: VERSION_KEY })
+  })
+
+  const state = updateState(data)
+  const busy = update.isPending
+
+  // `check_error` is the probe failing (offline, a private fork), not the
+  // plugin failing. It belongs in the tooltip, never in a banner.
+  const hint = error
+    ? errText(error)
+    : (data?.check_error ?? (data?.source ? `Quelle: ${data.source}` : ''))
+
+  const action =
+    state === 'restart'
+      ? jsx('span', {
+          className: 'text-[0.6875rem] text-(--ui-text-tertiary)',
+          children: 'installiert — Gateway neu starten'
+        })
+      : state === 'available'
+        ? jsxs(Button, {
+            disabled: busy,
+            onClick: () => setConfirming(true),
+            size: 'xs',
+            variant: 'secondary',
+            children: [
+              jsx(Codicon, { name: 'cloud-download', size: '0.75rem' }),
+              `Auf ${data.latest} aktualisieren`
+            ]
+          })
+        : jsx(Tip, {
+            label: state === 'unavailable' ? 'Dieses Hermes bietet keinen Installer an.' : 'Auf Updates prüfen',
+            children: jsx(Button, {
+              'aria-label': 'Auf Updates prüfen',
+              disabled: isFetching || state === 'unavailable',
+              onClick: () => void refetch(),
+              size: 'icon-xs',
+              variant: 'ghost',
+              children: jsx(Codicon, { name: isFetching ? 'sync' : 'refresh', size: '0.7rem' })
+            })
+          })
+
+  return jsxs('div', {
+    className: 'flex min-w-0 flex-col gap-1 text-[0.75rem]',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center gap-2',
+        children: [
+          jsx('span', {
+            className: 'shrink-0 text-(--ui-text-secondary)',
+            title: hint || undefined,
+            children: versionLabel(data)
+          }),
+          action
+        ]
+      }),
+      jsx('span', {
+        className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
+        children:
+          state === 'restart'
+            ? 'Die neue Version liegt bereits auf der Platte; der Gateway lädt sie beim nächsten Start.'
+            : 'Aktualisiert nur dieses Profil. Für alle Profile: scripts/update.ps1.'
+      }),
+      jsx(ConfirmDialog, {
+        confirmLabel: 'Aktualisieren',
+        description: `Kanban+ wird aus ${data?.source ?? 'seiner Quelle'} neu installiert (Version ${data?.latest ?? ''}). Danach muss der Gateway neu gestartet werden.`,
+        onClose: () => setConfirming(false),
+        onConfirm: () => {
+          setConfirming(false)
+          update.mutate()
+        },
+        open: confirming,
+        title: 'Kanban+ aktualisieren?'
+      })
+    ]
+  })
 }
 
 /** Stop/Start with the confirmation the destructive direction deserves. */
@@ -3327,7 +3480,11 @@ function KanbanPlusPage() {
       // stacked when the window is narrow.
       jsxs('div', {
         className: 'flex shrink-0 flex-wrap items-start gap-x-8 gap-y-2 px-4 py-2',
-        children: [jsx(MaxParallelField, { state }), jsx(BoardModelField, { state })]
+        children: [
+          jsx(MaxParallelField, { state }),
+          jsx(BoardModelField, { state }),
+          jsx(PluginUpdateField, {})
+        ]
       }),
       jsxs('div', {
         className: 'flex min-h-0 flex-1 border-t border-(--ui-stroke-tertiary)',

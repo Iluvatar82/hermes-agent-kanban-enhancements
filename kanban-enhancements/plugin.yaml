@@ -35,3 +35,7 @@ config_schema:
     type: integer
     default: 15
     description: "Minimum seconds between two worker context snapshots."
+  update_check:
+    type: boolean
+    default: true
+    description: "The Kanban+ page asks this plugin's source repository whether a newer version exists. False keeps the page from making that request; updating by hand still works."

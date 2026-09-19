@@ -15,6 +15,7 @@ patched core files, no desktop rebuild.
 | **A live cap on parallel runs** | `kanban.max_in_progress` is re-read on every tick, so changing it needs no restart, and `0` finally means *explicitly unbounded* instead of falling back to the memory-derived default. |
 | **A model for the whole board** | Pick one model and every task run *and* the auto-composer (decompose / specify) use it. A task that pins its own model keeps it. Unset = every profile uses its own model, exactly like the per-task override. |
 | **Timestamped worker logs** | Workers prefix every log line with the time they wrote it. Every existing reader keeps the classic format — the stamps are stripped unless a caller asks for them. |
+| **Updates from the page** | Kanban+ compares what is running, what is on disk and what its source repository has, and updates itself with one button. It knows the difference between *there is a new version* and *the new version is already installed and the gateway has not loaded it yet*. |
 | **Worker context snapshots** | Each worker writes how full its context window is next to its log, so you can see it from outside the process. |
 | **A desktop page** | `Kanban+` in the sidebar: the board switcher, the board's columns, board state, the controls above and the task view. Works the same opened as a split tile (right-click the sidebar row ▸ *Open in split*). Plus a status-bar pill, three command-palette entries and a context-fill strip above the chat composer. |
 
@@ -48,7 +49,28 @@ they find, from a local clone — useful for offline installs and for testing a 
 
 ## Update
 
-Every profile at once:
+### From the page
+
+The **Kanban+** page shows its own version beside the board settings, checks its source repository
+for a newer one, and installs it with one button. It goes through Hermes' own installer — the same
+entry point the desktop's *Install from Git* modal uses — so the result is identical to installing
+by hand, and it can only ever reinstall *this* plugin from the source Hermes recorded for it (a fork
+updates from the fork).
+
+Two things it deliberately does not hide:
+
+- **It updates the profile the gateway runs under, and only that one.** For every profile, use the
+  script below.
+- **The gateway keeps serving the old code until it restarts.** Installing replaces the directory
+  the backend was imported from, so the row switches to *installiert — Gateway neu starten* until
+  you do. That is also why the version line can read `Kanban+ 0.3.0 → 0.4.0`: running, then
+  installed.
+
+The update *check* is one HTTPS request to `raw.githubusercontent.com` for the manifest. Set
+`update_check: false` (see [Settings](#settings)) to stop the page making it; the button still
+works.
+
+### Every profile at once
 
 ```powershell
 pwsh -File scripts\update.ps1 -RestartGateway
@@ -140,6 +162,8 @@ the active board.
 | `POST /start` | Start the board and dispatch once |
 | `PUT /max-parallel` `{value}` | Write `kanban.max_in_progress` (`0` = unbounded) |
 | `PUT /model` `{model, provider}` | Set the board model; empty `model` clears it |
+| `GET /version` `?check=` | Running / installed / latest version, the recorded source, and whether a restart is pending |
+| `POST /update` `{ref?}` | Reinstall this plugin from its recorded source (`ref` pins one 40-character SHA) |
 | `GET /tasks` | Running tasks first, then recently touched ones |
 | `GET /tasks/{id}` | One task with its comments, activity, runs and dependency links — what the task view draws |
 | `PATCH /tasks/{id}` | Move a task to another column, or edit title/body/assignee/priority/model override |
@@ -157,6 +181,7 @@ Under `plugins.entries.kanban-enhancements.settings` in `config.yaml`:
 | `log_timestamps` | `true` | Workers stamp every log line. |
 | `worker_context_snapshots` | `true` | Workers write the context snapshot. |
 | `context_snapshot_interval_seconds` | `15` | Minimum seconds between two snapshots. |
+| `update_check` | `true` | The page asks the source repository whether a newer version exists. `false` stops that request; the update button still works. |
 
 Board state (the stop switch and the board model) lives in `kanban-enhancements.json` beside
 `kanban.db`, so it is per board and survives updates and reinstalls.
@@ -194,7 +219,7 @@ If you hit that, please open an issue with your Hermes version.
 ```bash
 git clone https://github.com/Iluvatar82/hermes-agent-kanban-enhancements
 cd hermes-agent-kanban-enhancements
-HERMES_AGENT_REPO=/path/to/hermes-agent pytest    # 65 tests against a real checkout
+HERMES_AGENT_REPO=/path/to/hermes-agent pytest    # 84 tests against a real checkout
 node --test tests/desktop/*.test.mjs              # the desktop helpers, with stubbed SDK
 ruff check .
 ```
@@ -213,6 +238,7 @@ kanban-enhancements/      the installable package (this is what lands in $HERMES
   dispatch_guard.py       the dispatch_once wrapper and the signature guard
   log_stamps.py           per-line log timestamps + the reader patch
   worker_context.py       the context snapshot
+  self_update.py          version arithmetic + the install this plugin runs on itself
   cli_commands.py         hermes kanban-plus …
   dashboard/plugin_api.py the REST namespace (board controls + the board directory)
   desktop/plugin.js       the desktop plugin (plain ESM, no build step): page, board
