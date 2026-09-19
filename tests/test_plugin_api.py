@@ -251,3 +251,168 @@ def test_board_can_include_the_archived_column(client, pkg, boards, monkeypatch)
 
     body = client.get("/api/plugins/kanban-enhancements/board?include_archived=true").json()
     assert [column["name"] for column in body["columns"]][-1] == "archived"
+
+
+# --- One task: the detail view, its status, its comments --------------------
+
+
+def _full_task(pkg, **overrides):
+    """A real ``kanban_db.Task`` — the detail endpoint runs ``asdict`` on it."""
+    kb = pkg.core.kanban_db()
+    fields = {
+        "id": "t_1", "title": "Ship it", "body": "Do the thing", "assignee": "dev",
+        "status": "running", "priority": 3, "created_by": "cli", "created_at": 1,
+        "started_at": 2, "completed_at": None, "workspace_kind": "worktree",
+        "workspace_path": "/tmp/w", "claim_lock": "secret-lock", "claim_expires": 99,
+        "tenant": "acme",
+    }
+    fields.update(overrides)
+    return kb.Task(**fields)
+
+
+@pytest.fixture
+def one_task(pkg, monkeypatch):
+    """A board with exactly ``t_1`` on it, and empty related collections."""
+    kb = pkg.core.kanban_db()
+    task = _full_task(pkg, model_override="qwen", provider_override="lmstudio")
+    monkeypatch.setattr(kb, "get_task", lambda conn, task_id: task if task_id == task.id else None)
+    monkeypatch.setattr(kb, "latest_summary", lambda conn, task_id: "worker said this")
+    monkeypatch.setattr(kb, "list_comments", lambda conn, task_id: [])
+    monkeypatch.setattr(kb, "list_events", lambda conn, task_id: [])
+    monkeypatch.setattr(kb, "list_runs", lambda conn, task_id: [])
+    monkeypatch.setattr(kb, "parent_ids", lambda conn, task_id: ["t_parent"])
+    monkeypatch.setattr(kb, "child_ids", lambda conn, task_id: [])
+    return task
+
+
+class _FakeUpdateBody:
+    """Stand-in for core's ``UpdateTaskBody``: only the two bits we touch."""
+
+    model_fields = {"status": None, "title": None, "body": None, "assignee": None,
+                    "priority": None, "model_override": None, "provider_override": None,
+                    "clear_model_override": None}
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+@pytest.fixture
+def fake_core(api, monkeypatch):
+    """Core's kanban API, faked: record what Kanban+ delegates to it."""
+    calls = []
+
+    def update_task(task_id, payload, board=None):
+        calls.append({"task_id": task_id, "fields": payload.kwargs, "board": board})
+        return {"task": {"id": task_id, **payload.kwargs}}
+
+    fake = types.SimpleNamespace(UpdateTaskBody=_FakeUpdateBody, update_task=update_task)
+    monkeypatch.setattr(api, "_core_kanban_api", lambda: fake)
+    return calls
+
+
+def test_task_detail_carries_everything_the_view_renders(client, one_task):
+    body = client.get("/api/plugins/kanban-enhancements/tasks/t_1").json()
+
+    assert body["task"]["title"] == "Ship it" and body["task"]["body"] == "Do the thing"
+    assert body["task"]["model_override"] == "qwen" and body["task"]["provider_override"] == "lmstudio"
+    assert body["task"]["workspace_path"] == "/tmp/w" and body["task"]["tenant"] == "acme"
+    # Workers hand off through a run summary, not tasks.result — the view needs it.
+    assert body["task"]["latest_summary"] == "worker said this"
+    assert body["links"] == {"parents": ["t_parent"], "children": []}
+    assert body["comments"] == [] and body["events"] == [] and body["runs"] == []
+
+
+def test_task_detail_never_ships_the_workers_claim_credentials(client, one_task):
+    task = client.get("/api/plugins/kanban-enhancements/tasks/t_1").json()["task"]
+
+    assert "claim_lock" not in task and "claim_expires" not in task and "idempotency_key" not in task
+
+
+def test_task_detail_trims_a_long_event_feed_to_the_newest(client, api, pkg, one_task, monkeypatch):
+    kb = pkg.core.kanban_db()
+    events = [kb.Event(id=n, task_id="t_1", kind="status", payload=None, created_at=n) for n in range(500)]
+    monkeypatch.setattr(kb, "list_events", lambda conn, task_id: events)
+
+    feed = client.get("/api/plugins/kanban-enhancements/tasks/t_1").json()["events"]
+    assert len(feed) == api._MAX_EVENTS
+    # Still oldest-first, but starting where the cap left off.
+    assert feed[0]["id"] == 500 - api._MAX_EVENTS and feed[-1]["id"] == 499
+
+
+def test_task_detail_is_404_for_a_task_that_is_not_there(client, one_task):
+    assert client.get("/api/plugins/kanban-enhancements/tasks/t_nope").status_code == 404
+
+
+def test_patch_delegates_the_move_to_cores_kanban_api(client, fake_core, boards):
+    body = client.patch("/api/plugins/kanban-enhancements/tasks/t_1?board=shipping",
+                        json={"status": "ready"})
+
+    assert body.status_code == 200
+    # The picked board must reach core too — separate boards, separate DBs.
+    assert fake_core == [{"task_id": "t_1", "fields": {"status": "ready"}, "board": "shipping"}]
+
+
+def test_patch_sends_only_the_fields_the_caller_actually_set(client, fake_core):
+    client.patch("/api/plugins/kanban-enhancements/tasks/t_1", json={"body": "new text"})
+
+    # `clear_model_override` has a default, but an unsent default is not an edit.
+    assert fake_core[0]["fields"] == {"body": "new text"}
+
+
+def test_patch_with_nothing_to_change_is_a_400(client, fake_core):
+    assert client.patch("/api/plugins/kanban-enhancements/tasks/t_1", json={}).status_code == 400
+
+
+def test_patch_refuses_a_field_this_hermes_does_not_know(client, api, monkeypatch):
+    class _Narrow:
+        model_fields = {"status": None}
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(api, "_core_kanban_api",
+                        lambda: types.SimpleNamespace(UpdateTaskBody=_Narrow, update_task=lambda *a, **k: {}))
+
+    answer = client.patch("/api/plugins/kanban-enhancements/tasks/t_1", json={"body": "x"})
+    assert answer.status_code == 501 and "body" in answer.json()["detail"]
+
+
+def test_patch_says_so_when_cores_kanban_api_is_out_of_reach(client, api, monkeypatch):
+    monkeypatch.setattr(api, "_core_kanban_api", lambda: None)
+
+    answer = client.patch("/api/plugins/kanban-enhancements/tasks/t_1", json={"status": "todo"})
+    assert answer.status_code == 503 and "kanban" in answer.json()["detail"]
+
+
+def test_a_comment_lands_on_the_task(client, pkg, one_task, monkeypatch):
+    written = []
+    monkeypatch.setattr(pkg.core.kanban_db(), "add_comment",
+                        lambda conn, task_id, author, body: written.append((task_id, author, body)) or 7)
+
+    answer = client.post("/api/plugins/kanban-enhancements/tasks/t_1/comments", json={"body": "look here"})
+    assert answer.json() == {"id": 7, "task_id": "t_1"}
+    assert written == [("t_1", "desktop", "look here")]
+
+
+def test_a_comment_on_an_unknown_task_is_404_and_an_empty_one_is_refused(client, one_task):
+    assert client.post("/api/plugins/kanban-enhancements/tasks/t_nope/comments",
+                       json={"body": "hi"}).status_code == 404
+    assert client.post("/api/plugins/kanban-enhancements/tasks/t_1/comments",
+                       json={"body": ""}).status_code == 422
+
+
+def test_the_patch_fields_are_the_fields_cores_kanban_api_accepts(api):
+    """The delegation seam itself, against the real checkout: a Hermes that
+    renamed one of these must fail HERE and not at the first drag on a board."""
+    core = api._core_kanban_api()
+    assert core is not None, "core's kanban plugin API could not be loaded"
+    assert set(api.TaskPatchBody.model_fields) <= set(core.UpdateTaskBody.model_fields)
+    assert callable(core.update_task)
+
+
+def test_the_task_fields_the_detail_view_reads_still_exist(pkg):
+    """Same seam on the read side: the view renders these by name."""
+    fields = set(pkg.core.kanban_db().Task.__dataclass_fields__)
+    assert {"body", "result", "model_override", "provider_override", "workspace_kind",
+            "workspace_path", "branch_name", "created_by", "worker_pid", "last_failure_error",
+            "consecutive_failures"} <= fields

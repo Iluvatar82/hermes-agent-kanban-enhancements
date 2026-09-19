@@ -7,8 +7,10 @@
  * jsx()/jsxs()/Fragment, exactly what a compiler would have emitted.
  *
  * What it adds on top of core Kanban:
- *   · a `/kanban-plus` page — board stop/start, a parallel-run cap, a board-wide
- *     model, the worker log with a time gutter, and a per-task context meter
+ *   · a `/kanban-plus` page — the board switcher, the lanes with drag & drop
+ *     and a card menu, board stop/start, a parallel-run cap, a board-wide
+ *     model, and a task view (core's drawer, plus a worker context meter and a
+ *     worker log that can take over the page)
  *   · a statusbar pill with a small stop/start menu
  *   · three command-palette rows
  *   · a 3px context-fill strip above the composer
@@ -16,6 +18,10 @@
  * Everything talks to this plugin's OWN backend namespace through `ctx.rest`
  * (`/api/plugins/kanban-enhancements`); the context breakdown for a chat session
  * and the model catalog come from the gateway via `host.request`.
+ *
+ * The page renders its own header (switcher included) rather than contributing
+ * to `WORKSPACE_PAGE_HEADER_AREA`: that band belongs to the MAIN workspace pane,
+ * so a page opened as a split tile never gets it.
  */
 
 import {
@@ -24,7 +30,6 @@ import {
   Codicon,
   COMPOSER_AREAS,
   ConfirmDialog,
-  Contribute,
   Dialog,
   DialogContent,
   DialogFooter,
@@ -55,7 +60,6 @@ import {
   SelectValue,
   StatusDot,
   Tip,
-  WORKSPACE_PAGE_HEADER_AREA,
   atom,
   cn,
   compactNumber,
@@ -131,8 +135,10 @@ const PROJECTS_KEY = ['kanban-plus', 'projects']
 const stateKey = slug => ['kanban-plus', 'state', slug]
 const tasksKey = slug => ['kanban-plus', 'tasks', slug]
 const boardKey = slug => ['kanban-plus', 'board', slug]
+const TASK_KEY = ['kanban-plus', 'task']
 const logKey = (slug, id) => ['kanban-plus', 'log', slug, id]
 const contextKey = (slug, id) => ['kanban-plus', 'context', slug, id]
+const taskKey = (slug, id) => ['kanban-plus', 'task', slug, id]
 
 const fetchState = () => api(withBoard('/state'))
 const fetchTasks = () => api(withBoard('/tasks'))
@@ -144,6 +150,11 @@ const putBoardModel = (model, provider) => api(withBoard('/model'), { method: 'P
 const fetchTaskLog = id =>
   api(withBoard(`/tasks/${encodeURIComponent(id)}/log`, { tail: '1048576', timestamps: 'true' }))
 const fetchTaskContext = id => api(withBoard(`/tasks/${encodeURIComponent(id)}/context`))
+const fetchTaskDetail = id => api(withBoard(`/tasks/${encodeURIComponent(id)}`))
+const patchTask = (id, patch) =>
+  api(withBoard(`/tasks/${encodeURIComponent(id)}`), { method: 'PATCH', body: patch })
+const postComment = (id, body) =>
+  api(withBoard(`/tasks/${encodeURIComponent(id)}/comments`), { method: 'POST', body: { author: 'desktop', body } })
 
 // The board directory itself. `ctx.rest` cannot leave this plugin's namespace,
 // so these mirror core's own `/boards` endpoints rather than borrowing them.
@@ -163,6 +174,9 @@ function refreshAll(qc) {
 
   void client.invalidateQueries({ queryKey: STATE_KEY })
   void client.invalidateQueries({ queryKey: TASKS_KEY })
+  // The open task view reads its own row — a move made from a card must show
+  // up in the panel beside it, not only in the lane the card left.
+  void client.invalidateQueries({ queryKey: TASK_KEY })
   // A stop reclaims running tasks back into Ready, so the lanes moved too.
   void client.invalidateQueries({ queryKey: BOARD_KEY })
   // A stop/start also flips the switcher's per-board marker.
@@ -377,12 +391,39 @@ function formatStamp(value) {
   return ms === null ? '' : fullFmt.format(new Date(ms))
 }
 
-function errText(err) {
-  if (err instanceof Error) {
-    return err.message
+/**
+ * A message worth showing. The desktop REST bridge rejects with
+ * `Error('409: {"detail":"…"}')`, and the raw form buries the one sentence that
+ * says WHY a move was refused ("blocked by parent …") behind a status code and
+ * a JSON blob.
+ */
+export function errText(err) {
+  const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : ''
+
+  if (!raw) {
+    return 'Unbekannter Fehler'
   }
 
-  return typeof err === 'string' && err ? err : 'Unbekannter Fehler'
+  const brace = raw.indexOf('{')
+
+  if (brace !== -1) {
+    try {
+      const detail = JSON.parse(raw.slice(brace))?.detail
+
+      if (typeof detail === 'string' && detail) {
+        return detail
+      }
+    } catch {
+      // Not JSON after all — the raw message is the best we have.
+    }
+  }
+
+  return raw
+}
+
+/** `t_ab12cd34` → `ab12cd` — the short form core's board puts on a card. */
+export function shortId(id) {
+  return String(id ?? '').replace(/^t_/, '').slice(0, 6)
 }
 
 /** Re-render on a tick so elapsed clocks move without a store behind them. */
@@ -427,6 +468,45 @@ function writeSelectedTask(slug, id) {
   } catch {
     // ignored — see readSelectedTask
   }
+}
+
+// ── shared chrome ────────────────────────────────────────────────────────────
+// The three atoms the task view is built from, matching core's own drawer so
+// the two pages read as one product.
+
+const FIELD_LABEL = 'text-[0.62rem] font-semibold tracking-[0.14em] text-(--ui-text-quaternary) uppercase'
+
+/** A labelled block, with an optional control on the right of the label row. */
+function Section({ action, children, label }) {
+  return jsxs('section', {
+    className: 'flex flex-col gap-1.5',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-2',
+        children: [jsx('div', { className: FIELD_LABEL, children: label }), action ?? null]
+      }),
+      children
+    ]
+  })
+}
+
+/** One `label · value` line of the meta table (a two-column grid owns it). */
+function MetaRow({ children, label, title }) {
+  return jsxs(Fragment, {
+    children: [
+      jsx('span', { className: 'text-(--ui-text-quaternary)', children: label }),
+      jsx('span', { className: 'min-w-0 truncate text-(--ui-text-secondary)', title, children })
+    ]
+  })
+}
+
+/** Body text that keeps the author's line breaks (descriptions, results). */
+function Prose({ children }) {
+  return jsx('p', {
+    className: 'whitespace-pre-wrap text-[0.75rem] leading-relaxed text-(--ui-text-secondary)',
+    'data-selectable-text': 'true',
+    children
+  })
 }
 
 // ── the context meter ────────────────────────────────────────────────────────
@@ -637,6 +717,11 @@ function TaskContextMeter({ running, taskId }) {
 }
 
 // ── worker log ───────────────────────────────────────────────────────────────
+// Two views of the same file. The task view carries the SMALL one — the tail,
+// plain, enough to see what the worker is doing without pushing the task's own
+// fields off screen. The four-arrow button in its header swaps it for the FULL
+// one: every line the backend sent, with the write-time gutter and the day
+// dividers, filling the page until Esc (or the button) gives the details back.
 
 const LogLine = memo(function LogLine({ row }) {
   return jsxs(Fragment, {
@@ -659,12 +744,61 @@ const LogLine = memo(function LogLine({ row }) {
   })
 })
 
-/** The log as a two-column timeline: write time left, text right, day dividers. */
-function TimestampedLog({ content }) {
+/**
+ * Keep only the last `limit` lines of a log. The small view is a glance, not an
+ * archive: rendering a 1 MiB tail into a 12rem box costs thousands of nodes
+ * nobody scrolls to. Works on the raw text so the stamps survive for the rows
+ * that are kept.
+ */
+export function logTail(content, limit) {
+  const text = String(content ?? '')
+
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return text
+  }
+
+  const lines = text.split('\n')
+  // A trailing newline is a terminator; keep it out of the count and put it back.
+  const trailing = lines.at(-1) === ''
+
+  if (trailing) {
+    lines.pop()
+  }
+
+  const kept = lines.length > limit ? lines.slice(-limit) : lines
+
+  if (kept.length === 0) {
+    return ''
+  }
+
+  return trailing ? `${kept.join('\n')}\n` : kept.join('\n')
+}
+
+/** Lines the small log keeps — roughly a screenful and a half of scrollback. */
+const SMALL_LOG_LINES = 300
+
+/**
+ * The log as a two-column timeline: write time left, text right, day dividers.
+ * `compact` drops the gutter and the dividers — the small view has no room for
+ * a time column, and the full view is one button away.
+ */
+function TimestampedLog({ compact = false, content }) {
   const rows = useMemo(() => buildLogRows(content), [content])
 
   if (!rows.length) {
     return jsx('div', { className: 'font-mono text-[0.75rem] text-(--ui-text-quaternary)', children: '—' })
+  }
+
+  if (compact) {
+    return jsx('div', {
+      className: 'flex flex-col font-mono text-[0.6875rem] leading-[1.55] text-(--ui-text-tertiary)',
+      'data-selectable-text': 'true',
+      children: rows
+        .filter(row => row.kind === 'line')
+        .map((row, index) =>
+          jsx('span', { className: 'break-words whitespace-pre-wrap', children: row.text || ' ' }, index)
+        )
+    })
   }
 
   return jsx('div', {
@@ -694,28 +828,40 @@ function TimestampedLog({ content }) {
 /** Pixels from the bottom that still count as "following" the tail. */
 const FOLLOW_SLACK_PX = 48
 
-/**
- * The selected task's worker log: fills the remaining height, follows the tail
- * unless the reader scrolled up, and refetches every 3s while the task runs.
- */
-function WorkerLogPanel({ task }) {
-  const running = task.status === 'running'
+/** The selected task's log — fast poll while it runs, slow once it is done. */
+function useTaskLog(task) {
   const slug = useValue($boardSlug)
+
+  return useQuery({
+    enabled: Boolean(task?.id),
+    queryFn: () => fetchTaskLog(task.id),
+    queryKey: logKey(slug, task?.id ?? ''),
+    refetchInterval: task?.status === 'running' ? 3_000 : 15_000
+  })
+}
+
+/** `1.2 MiB · gekürzt` — what of the file actually arrived. */
+function logMeta(log) {
+  const parts = []
+
+  if (log?.size_bytes != null) {
+    parts.push(formatBytes(log.size_bytes))
+  }
+
+  if (log?.truncated) {
+    parts.push('gekürzt')
+  }
+
+  return parts.join(' · ')
+}
+
+/**
+ * The scroller both views share: follows the tail unless the reader scrolled
+ * up, and re-follows as soon as they come back down.
+ */
+function LogScroller({ children, className, content }) {
   const scrollRef = useRef(null)
   const followRef = useRef(true)
-
-  const {
-    data: log,
-    error,
-    isLoading
-  } = useQuery({
-    queryFn: () => fetchTaskLog(task.id),
-    queryKey: logKey(slug, task.id),
-    refetchInterval: running ? 3_000 : 15_000
-  })
-
-  // No "re-arm on task switch" effect: the page keys this panel by task id, so
-  // a different task remounts it and `followRef` starts at true again.
 
   // Layout effect, not effect: scroll before paint so the tail never flickers.
   useLayoutEffect(() => {
@@ -724,95 +870,144 @@ function WorkerLogPanel({ task }) {
     if (el && followRef.current) {
       el.scrollTop = el.scrollHeight
     }
-  }, [log?.content])
+  }, [content])
 
-  const onScroll = () => {
-    const el = scrollRef.current
+  return jsx('div', {
+    className,
+    onScroll: () => {
+      const el = scrollRef.current
 
-    if (el) {
-      followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < FOLLOW_SLACK_PX
-    }
+      if (el) {
+        followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < FOLLOW_SLACK_PX
+      }
+    },
+    ref: scrollRef,
+    children
+  })
+}
+
+/** Loader / error / "no log yet" — the three states that are not a log. */
+function LogPlaceholder({ error, isLoading, log }) {
+  if (isLoading && !log) {
+    return jsx('div', { className: 'grid h-full place-items-center py-4', children: jsx(Loader, {}) })
   }
 
-  const meta = []
-
-  if (log?.size_bytes != null) {
-    meta.push(formatBytes(log.size_bytes))
+  if (error) {
+    return jsx(ErrorState, { description: errText(error), title: 'Log konnte nicht geladen werden' })
   }
 
-  if (log?.truncated) {
-    meta.push('gekürzt')
+  if (log && log.exists === false) {
+    return jsx(EmptyState, { description: 'Dieser Task hat (noch) keine Log-Datei.', title: 'Kein Log' })
   }
 
-  return jsxs('section', {
-    className: 'flex min-h-0 min-w-0 flex-1 flex-col',
+  return null
+}
+
+/** The four-arrow button: the one control that swaps small for full. */
+function LogSizeButton({ expanded, onClick }) {
+  const label = expanded ? 'Log verkleinern (Esc)' : 'Log vergrößern'
+
+  return jsx(Tip, {
+    label,
+    children: jsx(Button, {
+      'aria-label': label,
+      className: 'shrink-0',
+      onClick,
+      size: 'icon-xs',
+      variant: 'ghost',
+      children: jsx(Codicon, { name: expanded ? 'screen-normal' : 'screen-full', size: '0.8rem' })
+    })
+  })
+}
+
+/** The small log inside the task view: the tail, plain, one button from full. */
+function TaskLogSection({ onExpand, task }) {
+  const { data: log, error, isLoading } = useTaskLog(task)
+  const meta = logMeta(log)
+  const tail = useMemo(() => logTail(log?.content ?? '', SMALL_LOG_LINES), [log?.content])
+  const placeholder = jsx(LogPlaceholder, { error, isLoading, log })
+
+  return jsxs(Section, {
+    action: jsxs('div', {
+      className: 'flex items-center gap-1.5',
+      children: [
+        meta ? jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: meta }) : null,
+        jsx(LogSizeButton, { expanded: false, onClick: onExpand })
+      ]
+    }),
+    label: 'Worker-Log',
+    children: jsx('div', {
+      className: 'rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-quaternary)/40',
+      children:
+        placeholder ??
+        jsx(LogScroller, {
+          className: 'max-h-48 overflow-auto px-2 py-1.5',
+          content: tail,
+          children: jsx(TimestampedLog, { compact: true, content: tail })
+        })
+    })
+  })
+}
+
+/**
+ * The full log, over the whole page: every line the backend sent, with its
+ * write time and the day dividers. Esc — or the same button, now pointing
+ * inward — puts the task's details back.
+ */
+function LogOverlay({ onClose, task }) {
+  const { data: log, error, isLoading } = useTaskLog(task)
+  const meta = logMeta(log)
+  const placeholder = jsx(LogPlaceholder, { error, isLoading, log })
+
+  return jsxs('div', {
+    className: 'absolute inset-0 z-30 flex flex-col bg-(--ui-surface-background)',
+    'data-slot': 'kanban-plus-log-overlay',
     children: [
       jsxs('header', {
-        className: 'flex shrink-0 flex-col gap-2 border-b border-(--ui-stroke-tertiary) px-4 pt-3 pb-2.5',
+        className:
+          'flex shrink-0 flex-wrap items-center gap-2 border-b border-(--ui-stroke-tertiary) px-4 pt-3 pb-2.5',
         children: [
-          jsxs('div', {
-            className: 'flex items-center gap-2',
+          jsxs('span', {
+            className:
+              'flex items-center gap-1.5 rounded-full bg-(--ui-bg-quaternary) px-2 py-0.5 text-[0.625rem] font-semibold tracking-wide text-(--ui-text-secondary) uppercase',
+            children: [jsx(Codicon, { name: 'tasklist', size: '0.75rem' }), 'Worker-Log']
+          }),
+          jsx('h2', {
+            className: 'min-w-0 truncate text-sm font-semibold text-foreground',
+            title: task.title,
+            children: task.title || task.id
+          }),
+          jsx('span', {
+            className: 'shrink-0 font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
+            'data-selectable-text': 'true',
+            children: task.id
+          }),
+          jsxs(Badge, {
+            size: 'xs',
+            variant: task.status === 'running' ? 'default' : 'muted',
             children: [
-              jsxs('span', {
-                className:
-                  'flex items-center gap-1.5 rounded-full bg-(--ui-bg-quaternary) px-2 py-0.5 text-[0.625rem] font-semibold tracking-wide text-(--ui-text-secondary) uppercase',
-                children: [jsx(Codicon, { name: 'tasklist', size: '0.75rem' }), 'Worker-Log']
-              }),
-              jsx('span', {
-                className: 'font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
-                'data-selectable-text': 'true',
-                children: task.id
-              }),
-              jsxs(Badge, {
-                size: 'xs',
-                variant: running ? 'default' : 'muted',
-                children: [
-                  running
-                    ? jsx('span', { className: 'mr-1 inline-block size-1.5 animate-pulse rounded-full bg-current' })
-                    : null,
-                  task.status
-                ]
-              }),
-              meta.length > 0
-                ? jsx('span', {
-                    className: 'ml-auto text-[0.625rem] text-(--ui-text-quaternary)',
-                    children: meta.join(' · ')
-                  })
-                : null
+              task.status === 'running'
+                ? jsx('span', { className: 'mr-1 inline-block size-1.5 animate-pulse rounded-full bg-current' })
+                : null,
+              task.status
             ]
           }),
           jsxs('div', {
-            className: 'flex items-center gap-2',
+            className: 'ml-auto flex shrink-0 items-center gap-1.5',
             children: [
-              jsx('h2', {
-                className: 'min-w-0 truncate text-sm font-semibold text-foreground',
-                title: task.title,
-                children: task.title
-              }),
-              task.assignee
-                ? jsx('span', {
-                    className: 'shrink-0 text-[0.75rem] text-(--ui-text-tertiary)',
-                    children: task.assignee
-                  })
-                : null
+              meta ? jsx('span', { className: 'text-[0.625rem] text-(--ui-text-quaternary)', children: meta }) : null,
+              jsx(LogSizeButton, { expanded: true, onClick: onClose })
             ]
-          }),
-          jsx(TaskContextMeter, { running, taskId: task.id })
+          })
         ]
       }),
-      jsx('div', {
-        className: 'min-h-0 flex-1 overflow-auto px-4 py-3',
-        onScroll,
-        ref: scrollRef,
-        children:
-          isLoading && !log
-            ? jsx('div', { className: 'grid h-full place-items-center', children: jsx(Loader, {}) })
-            : error
-              ? jsx(ErrorState, { description: errText(error), title: 'Log konnte nicht geladen werden' })
-              : log && log.exists === false
-                ? jsx(EmptyState, { description: 'Dieser Task hat (noch) keine Log-Datei.', title: 'Kein Log' })
-                : jsx(TimestampedLog, { content: log?.content ?? '' })
-      })
+      placeholder
+        ? jsx('div', { className: 'grid min-h-0 flex-1 place-items-center p-6', children: placeholder })
+        : jsx(LogScroller, {
+            className: 'min-h-0 flex-1 overflow-auto px-4 py-3',
+            content: log?.content,
+            children: jsx(TimestampedLog, { content: log?.content ?? '' })
+          })
     ]
   })
 }
@@ -1045,13 +1240,11 @@ function CatalogError({ message, onRetry, pending }) {
 }
 
 /**
- * The board's model: what every dispatched task worker AND the auto-composer's
- * decompose/specify calls run on. Unset means inherit, exactly like the
- * per-task override — so the trigger reads `provider: model` or the inherit
- * copy, and the clear button beside it puts it back.
+ * The model picker itself: a searchable, provider-grouped catalog behind a
+ * trigger that reads `provider: model`. Shared by the BOARD model and a single
+ * task's override — same catalog, same shape, different place to write it.
  */
-function BoardModelField({ state }) {
-  const qc = useQueryClient()
+function ModelPicker({ ariaLabel, current, disabled, inheritCopy, labelledBy, onPick, triggerClassName }) {
   const [open, setOpen] = useState(false)
   // Sticky: once the catalog is asked for it stays cached for this page.
   const [opened, setOpened] = useState(false)
@@ -1060,22 +1253,6 @@ function BoardModelField({ state }) {
 
   const { data, error, isFetching, refetch } = useModelOptions(opened)
   const providers = useMemo(() => normalizeProviders(data), [data])
-
-  const current = { model: state?.model ?? '', provider: state?.provider ?? '' }
-  const isSet = Boolean(String(current.model).trim())
-
-  const save = useMutation({
-    mutationFn: ({ model, provider }) => putBoardModel(model, provider),
-    onError: err => host.notifyError(err, 'Board-Modell konnte nicht gesetzt werden'),
-    onSuccess: (_result, variables) =>
-      host.notify({
-        kind: 'info',
-        message: variables.model
-          ? `Board-Modell: ${modelLabel(variables, MODEL_INHERIT)}`
-          : 'Board-Modell zurückgesetzt'
-      }),
-    onSettled: () => void qc.invalidateQueries({ queryKey: STATE_KEY })
-  })
 
   const groups = useMemo(() => {
     const needle = query.trim().toLowerCase()
@@ -1100,7 +1277,7 @@ function BoardModelField({ state }) {
 
   const pick = (model, provider) => {
     setOpen(false)
-    save.mutate({ model, provider })
+    onPick(model, provider)
   }
 
   const body = error
@@ -1172,6 +1349,113 @@ function BoardModelField({ state }) {
               })
             })
 
+  return jsxs(Popover, {
+    onOpenChange: next => {
+      setOpen(next)
+
+      if (next) {
+        setOpened(true)
+        setQuery('')
+      }
+    },
+    open,
+    children: [
+      jsx(PopoverTrigger, {
+        asChild: true,
+        children: jsxs(Button, {
+          'aria-label': labelledBy ? undefined : ariaLabel,
+          'aria-labelledby': labelledBy,
+          className: cn(
+            'h-7 justify-between gap-2 px-2 font-normal',
+            !String(current.model ?? '').trim() && 'text-(--ui-text-tertiary)',
+            triggerClassName
+          ),
+          disabled,
+          type: 'button',
+          variant: 'outline',
+          children: [
+            jsx('span', { className: 'min-w-0 truncate', children: modelLabel(current, inheritCopy) }),
+            jsx(Codicon, { className: 'shrink-0 opacity-50', name: 'chevron-down', size: '0.7rem' })
+          ]
+        })
+      }),
+      jsx(PopoverContent, {
+        align: 'start',
+        className: 'w-72 p-0',
+        // Radix focuses the content itself by default; take the focus to
+        // the search field instead so typing filters straight away.
+        onOpenAutoFocus: event => {
+          event.preventDefault()
+          searchRef.current?.focus()
+        },
+        side: 'bottom',
+        children: jsxs('div', {
+          className: 'flex flex-col',
+          children: [
+            jsx('div', {
+              className: 'border-b border-(--ui-stroke-tertiary) px-2 py-1',
+              children: jsx(SearchField, {
+                'aria-label': 'Modelle durchsuchen',
+                containerClassName: 'w-full',
+                inputClassName: 'w-full',
+                inputRef: searchRef,
+                loading: isFetching && !data,
+                onChange: setQuery,
+                placeholder: 'Modell suchen…',
+                value: query
+              })
+            }),
+            body
+          ]
+        })
+      })
+    ]
+  })
+}
+
+/** The reset-to-inherit button beside a picker; nothing when nothing is pinned. */
+function ClearModelButton({ disabled, label, onClear, shown }) {
+  if (!shown) {
+    return null
+  }
+
+  return jsx(Tip, {
+    label,
+    children: jsx(Button, {
+      'aria-label': label,
+      disabled,
+      onClick: onClear,
+      size: 'icon-xs',
+      variant: 'ghost',
+      children: jsx(Codicon, { name: 'close', size: '0.7rem' })
+    })
+  })
+}
+
+/**
+ * The board's model: what every dispatched task worker AND the auto-composer's
+ * decompose/specify calls run on. Unset means inherit, exactly like the
+ * per-task override — so the trigger reads `provider: model` or the inherit
+ * copy, and the clear button beside it puts it back.
+ */
+function BoardModelField({ state }) {
+  const qc = useQueryClient()
+  const current = { model: state?.model ?? '', provider: state?.provider ?? '' }
+  const isSet = Boolean(String(current.model).trim())
+
+  const save = useMutation({
+    mutationFn: ({ model, provider }) => putBoardModel(model, provider),
+    onError: err => host.notifyError(err, 'Board-Modell konnte nicht gesetzt werden'),
+    onSuccess: (_result, variables) =>
+      host.notify({
+        kind: 'info',
+        message: variables.model
+          ? `Board-Modell: ${modelLabel(variables, MODEL_INHERIT)}`
+          : 'Board-Modell zurückgesetzt'
+      }),
+    onSettled: () => void qc.invalidateQueries({ queryKey: STATE_KEY })
+  })
+
   return jsxs('div', {
     className: 'flex min-w-0 flex-col gap-1 text-[0.75rem]',
     children: [
@@ -1183,79 +1467,20 @@ function BoardModelField({ state }) {
             id: 'kanban-plus-model-label',
             children: 'Board-Modell'
           }),
-          jsxs(Popover, {
-            onOpenChange: next => {
-              setOpen(next)
-
-              if (next) {
-                setOpened(true)
-                setQuery('')
-              }
-            },
-            open,
-            children: [
-              jsx(PopoverTrigger, {
-                asChild: true,
-                children: jsxs(Button, {
-                  'aria-labelledby': 'kanban-plus-model-label',
-                  className: cn(
-                    'h-7 max-w-64 justify-between gap-2 px-2 font-normal',
-                    !isSet && 'text-(--ui-text-tertiary)'
-                  ),
-                  disabled: save.isPending,
-                  type: 'button',
-                  variant: 'outline',
-                  children: [
-                    jsx('span', { className: 'min-w-0 truncate', children: modelLabel(current, MODEL_INHERIT) }),
-                    jsx(Codicon, { className: 'shrink-0 opacity-50', name: 'chevron-down', size: '0.7rem' })
-                  ]
-                })
-              }),
-              jsx(PopoverContent, {
-                align: 'start',
-                className: 'w-72 p-0',
-                // Radix focuses the content itself by default; take the focus to
-                // the search field instead so typing filters straight away.
-                onOpenAutoFocus: event => {
-                  event.preventDefault()
-                  searchRef.current?.focus()
-                },
-                side: 'bottom',
-                children: jsxs('div', {
-                  className: 'flex flex-col',
-                  children: [
-                    jsx('div', {
-                      className: 'border-b border-(--ui-stroke-tertiary) px-2 py-1',
-                      children: jsx(SearchField, {
-                        'aria-label': 'Modelle durchsuchen',
-                        containerClassName: 'w-full',
-                        inputClassName: 'w-full',
-                        inputRef: searchRef,
-                        loading: isFetching && !data,
-                        onChange: setQuery,
-                        placeholder: 'Modell suchen…',
-                        value: query
-                      })
-                    }),
-                    body
-                  ]
-                })
-              })
-            ]
+          jsx(ModelPicker, {
+            current,
+            disabled: save.isPending,
+            inheritCopy: MODEL_INHERIT,
+            labelledBy: 'kanban-plus-model-label',
+            onPick: (model, provider) => save.mutate({ model, provider }),
+            triggerClassName: 'max-w-64'
           }),
-          isSet
-            ? jsx(Tip, {
-                label: 'Board-Modell zurücksetzen',
-                children: jsx(Button, {
-                  'aria-label': 'Board-Modell zurücksetzen',
-                  disabled: save.isPending,
-                  onClick: () => save.mutate({ model: '', provider: '' }),
-                  size: 'icon-xs',
-                  variant: 'ghost',
-                  children: jsx(Codicon, { name: 'close', size: '0.7rem' })
-                })
-              })
-            : null
+          jsx(ClearModelButton, {
+            disabled: save.isPending,
+            label: 'Board-Modell zurücksetzen',
+            onClear: () => save.mutate({ model: '', provider: '' }),
+            shown: isSet
+          })
         ]
       }),
       jsx('span', {
@@ -1460,7 +1685,6 @@ function TaskGroup({ label, now, onSelect, selectedId, tasks }) {
 /** Mirrors `kanban_db.DEFAULT_BOARD` — the board that always exists. */
 const DEFAULT_BOARD = 'default'
 const NO_PROJECT = '__none__'
-const FIELD_LABEL = 'text-[0.62rem] font-semibold uppercase tracking-[0.14em] text-(--ui-text-quaternary)'
 const ARCHIVE_FILTERS = [{ extensions: ['tar.gz', 'tgz'], name: 'Hermes-Board' }]
 
 /** The slug `boards create` makes of a display name. */
@@ -1787,7 +2011,9 @@ function BoardSwitcher() {
               asChild: true,
               children: jsxs(Button, {
                 'aria-label': `Board: ${label}`,
-                className: 'h-full min-w-0 max-w-full gap-1.5 px-2',
+                // Sized like the page's other controls now that it sits
+                // in the page header rather than filling a header band.
+                className: 'h-7 min-w-0 max-w-64 gap-1.5 px-2',
                 size: 'sm',
                 variant: 'ghost',
                 children: [
@@ -1901,8 +2127,9 @@ function BoardSwitcher() {
 // ── the board columns ────────────────────────────────────────────────────────
 // The lanes core's Kanban page draws, in core's order and with its icons and
 // tones (`COLUMN_META` in the core plugin's types.ts). Kanban+ is a board page:
-// a card has to be visible HERE, not only in the running/recent list beside the
-// log. Cards select the task the log and the context meter below them show.
+// a card has to be visible HERE, not only in the running list beside it. Cards
+// select the task the detail panel shows, drag between lanes, and carry the
+// same right-click menu core's cards do.
 
 const COLUMN_META = {
   triage: { codicon: 'inbox', label: 'Triage', tone: 'var(--ui-text-tertiary)' },
@@ -1921,7 +2148,186 @@ export function columnMeta(name) {
   return COLUMN_META[name] ?? { codicon: 'circle-outline', label: String(name ?? ''), tone: 'var(--ui-text-secondary)' }
 }
 
-function BoardCard({ now, onSelect, selected, task }) {
+// System-owned lanes: a card can be dragged OUT of them, never INTO them.
+// `running` and `review` are the dispatcher's to claim, and `scheduled` needs a
+// wake-up time only an agent or the CLI can attach — core refuses a bare status
+// move into any of them with a 409, so neither the lanes nor the menus offer
+// them as a target in the first place.
+const LOCKED_COLUMNS = ['review', 'running', 'scheduled']
+
+// Core's lane order, minus `archived` (core archives from a menu, not a lane).
+// Stands in while `GET /board` is still in flight, so a task view restored from
+// the remembered selection offers its move targets on the first paint.
+const BOARD_COLUMN_ORDER = Object.keys(COLUMN_META).filter(name => name !== 'archived')
+
+/** True for a lane nothing may be dropped into. */
+export function isLockedTarget(name) {
+  return LOCKED_COLUMNS.includes(name)
+}
+
+/** The lanes a card in `status` may be moved to — every open lane but its own. */
+export function moveTargets(columns, status) {
+  return (columns ?? []).filter(name => name !== status && !isLockedTarget(name))
+}
+
+/** The one place a status change is written — drag, card menu and status menu
+ *  all land here, so they refuse, toast and refresh identically. */
+function useTaskMove() {
+  const qc = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ id, status }) => patchTask(id, { status }),
+    onError: err => host.notifyError(err, 'Task konnte nicht verschoben werden'),
+    onSuccess: (_result, { status }) =>
+      host.notify({ kind: 'info', message: `Verschoben nach ${columnMeta(status).label}` }),
+    onSettled: () => refreshAll(qc)
+  })
+}
+
+// ── the card's right-click menu ──────────────────────────────────────────────
+// Hand-rolled on purpose: the SDK's ContextMenu is not part of the export
+// surface this plugin can count on across the Hermes versions it must keep
+// running against, and one missing named import fails the whole file at load.
+
+/** Distance kept from the viewport edge when a menu would overflow it. */
+const MENU_MARGIN_PX = 6
+
+/**
+ * Clamp a menu box into the viewport. Pure, so the arithmetic that decides
+ * whether a menu opens off screen is testable without a DOM.
+ */
+export function clampMenu({ height, viewportHeight, viewportWidth, width, x, y }) {
+  // A viewport smaller than the menu would push `left` negative through the
+  // Math.min; the outer Math.max pins it to the margin instead.
+  const fit = (value, size, viewport) =>
+    Math.max(MENU_MARGIN_PX, Math.min(value, viewport - size - MENU_MARGIN_PX))
+
+  return { left: fit(x, width, viewportWidth), top: fit(y, height, viewportHeight) }
+}
+
+/** One floating menu at `(x, y)`: rows, separators, Esc and click-away. */
+function ContextMenuLayer({ items, onClose, x, y }) {
+  const ref = useRef(null)
+  const [box, setBox] = useState({ left: x, top: y })
+
+  // Measure before paint, then clamp — a menu opened near the right edge must
+  // not render half off screen for a frame.
+  useLayoutEffect(() => {
+    const el = ref.current
+    const scope = typeof window === 'undefined' ? null : window
+
+    if (!el || !scope) {
+      return
+    }
+
+    const rect = el.getBoundingClientRect()
+
+    setBox(
+      clampMenu({
+        height: rect.height,
+        viewportHeight: scope.innerHeight,
+        viewportWidth: scope.innerWidth,
+        width: rect.width,
+        x,
+        y
+      })
+    )
+  }, [x, y])
+
+  useEffect(() => {
+    const scope = typeof window === 'undefined' ? null : window
+
+    if (!scope) {
+      return undefined
+    }
+
+    const onKey = event => {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        onClose()
+      }
+    }
+    // Capture, and only outside the menu: a row's own click must still land.
+    const onPointer = event => {
+      if (!ref.current?.contains(event.target)) {
+        onClose()
+      }
+    }
+
+    scope.addEventListener('keydown', onKey, true)
+    scope.addEventListener('mousedown', onPointer, true)
+    scope.addEventListener('resize', onClose)
+
+    return () => {
+      scope.removeEventListener('keydown', onKey, true)
+      scope.removeEventListener('mousedown', onPointer, true)
+      scope.removeEventListener('resize', onClose)
+    }
+  }, [onClose])
+
+  return jsx('div', {
+    className:
+      'fixed z-50 min-w-44 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) py-1 shadow-lg',
+    ref,
+    role: 'menu',
+    style: { left: box.left, top: box.top },
+    children: items.map((item, index) =>
+      item.kind === 'separator'
+        ? jsx('div', { className: 'my-1 h-px bg-(--ui-stroke-tertiary)' }, `sep-${index}`)
+        : jsxs(
+            'button',
+            {
+              className:
+                'flex w-full items-center gap-2 px-2.5 py-1 text-left text-[0.75rem] text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+              onClick: () => {
+                onClose()
+                item.onSelect()
+              },
+              role: 'menuitem',
+              type: 'button',
+              children: [
+                item.tone
+                  ? jsx('span', {
+                      className: 'size-2 shrink-0 rounded-full',
+                      style: { background: item.tone }
+                    })
+                  : jsx(Codicon, { className: 'shrink-0', name: item.codicon ?? 'blank', size: '0.8rem' }),
+                jsx('span', { className: 'min-w-0 flex-1 truncate', children: item.label })
+              ]
+            },
+            item.label
+          )
+    )
+  })
+}
+
+/** The card menu's rows: open, the lanes it may move to, copy its id. */
+function cardMenuItems({ columns, onMove, onOpen, task }) {
+  const targets = moveTargets(columns, task.status)
+
+  return [
+    { codicon: 'link-external', label: 'Details öffnen', onSelect: () => onOpen(task.id) },
+    ...(targets.length > 0 ? [{ kind: 'separator' }] : []),
+    ...targets.map(name => ({
+      label: `Verschieben nach ${columnMeta(name).label}`,
+      onSelect: () => onMove(task.id, name),
+      tone: columnMeta(name).tone
+    })),
+    { kind: 'separator' },
+    {
+      codicon: 'copy',
+      label: 'Task-ID kopieren',
+      onSelect: () => {
+        void navigator.clipboard?.writeText(task.id)
+        host.notify({ kind: 'info', message: `Kopiert: ${task.id}` })
+      }
+    }
+  ]
+}
+
+function BoardCard({ columns, now, onMove, onSelect, selected, task }) {
+  const [dragging, setDragging] = useState(false)
+  const [menu, setMenu] = useState(null)
   const running = task.status === 'running'
   const startedMs = parseMs(task.started_at)
   const meta = []
@@ -1942,34 +2348,106 @@ function BoardCard({ now, onSelect, selected, task }) {
     meta.push(`${task.comment_count} ${task.comment_count === 1 ? 'Kommentar' : 'Kommentare'}`)
   }
 
-  return jsxs('button', {
-    className: cn(
-      'flex w-full flex-col gap-1 rounded-md border px-2 py-1.5 text-left transition-colors',
-      selected
-        ? 'border-(--color-primary) bg-(--ui-bg-tertiary)'
-        : 'border-(--ui-stroke-tertiary) hover:bg-(--ui-bg-tertiary)'
-    ),
-    onClick: () => onSelect(task.id),
-    title: task.title,
-    type: 'button',
+  return jsxs(Fragment, {
     children: [
-      jsx('span', { className: 'line-clamp-2 text-[0.75rem] leading-snug text-foreground', children: task.title }),
-      meta.length > 0
-        ? jsx('span', {
-            className: 'truncate text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
-            children: meta.join(' · ')
+      // A div, not a button: Chromium suppresses a drag that starts on a form
+      // control often enough that a draggable <button> is a coin flip. The
+      // role/tabIndex/keydown trio puts the keyboard affordance back.
+      jsxs('div', {
+        className: cn(
+          'flex w-full cursor-grab flex-col gap-1 rounded-md border px-2 py-1.5 text-left transition-colors active:cursor-grabbing',
+          'focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-(--color-primary)',
+          selected
+            ? 'border-(--color-primary) bg-(--ui-bg-tertiary)'
+            : 'border-(--ui-stroke-tertiary) hover:bg-(--ui-bg-tertiary)',
+          dragging && 'opacity-40'
+        ),
+        draggable: true,
+        onClick: () => onSelect(task.id),
+        onContextMenu: event => {
+          event.preventDefault()
+          setMenu({ x: event.clientX, y: event.clientY })
+        },
+        onKeyDown: event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault()
+            onSelect(task.id)
+          }
+        },
+        role: 'button',
+        tabIndex: 0,
+        onDragEnd: () => setDragging(false),
+        onDragStart: event => {
+          event.dataTransfer.setData('text/plain', task.id)
+          event.dataTransfer.effectAllowed = 'move'
+          // Snapshot the drag image BEFORE dimming the source, or the ghost
+          // bakes in the 40% and the cursor drags a washed-out card.
+          event.dataTransfer.setDragImage?.(event.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY)
+          setDragging(true)
+        },
+        title: task.title,
+        children: [
+          jsx('span', { className: 'line-clamp-2 text-[0.75rem] leading-snug text-foreground', children: task.title }),
+          meta.length > 0
+            ? jsx('span', {
+                className: 'truncate text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
+                children: meta.join(' · ')
+              })
+            : null
+        ]
+      }),
+      menu
+        ? jsx(ContextMenuLayer, {
+            items: cardMenuItems({ columns, onMove, onOpen: onSelect, task }),
+            onClose: () => setMenu(null),
+            x: menu.x,
+            y: menu.y
           })
         : null
     ]
   })
 }
 
-function BoardColumn({ column, now, onSelect, selectedId }) {
+function BoardColumn({ column, columns, now, onMove, onSelect, selectedId }) {
+  const [over, setOver] = useState(false)
   const meta = columnMeta(column.name)
+  const locked = isLockedTarget(column.name)
   const tasks = column.tasks ?? []
 
+  // A locked lane deliberately does NOT preventDefault: the OS then shows the
+  // no-drop cursor and never fires `drop`, so the lane is honest about itself
+  // instead of accepting a move the backend would refuse with a 409.
+  const dragHandlers = {
+    onDragLeave: () => setOver(false),
+    onDragOver: event => {
+      if (locked) {
+        event.dataTransfer.dropEffect = 'none'
+
+        return
+      }
+
+      event.preventDefault()
+      event.dataTransfer.dropEffect = 'move'
+      setOver(true)
+    },
+    onDrop: event => {
+      event.preventDefault()
+      setOver(false)
+
+      const id = event.dataTransfer.getData('text/plain')
+
+      if (id && !tasks.some(task => task.id === id)) {
+        onMove(id, column.name)
+      }
+    }
+  }
+
   return jsxs('section', {
-    className: 'flex h-full w-56 shrink-0 flex-col gap-1.5',
+    ...dragHandlers,
+    className: cn(
+      'flex h-full w-56 shrink-0 flex-col gap-1.5 rounded-lg p-1.5 transition-colors',
+      over && !locked && 'bg-(--ui-bg-quinary) ring-1 ring-(--color-primary)/40'
+    ),
     children: [
       jsxs('div', {
         className: 'flex shrink-0 items-center gap-1.5 px-0.5',
@@ -1989,7 +2467,17 @@ function BoardColumn({ column, now, onSelect, selectedId }) {
             className:
               'rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)',
             children: tasks.length
-          })
+          }),
+          locked
+            ? jsx(Tip, {
+                label: 'Diese Spalte vergibt der Dispatcher — hier kann nichts abgelegt werden.',
+                children: jsx(Codicon, {
+                  className: 'ml-auto shrink-0 text-(--ui-text-quaternary)',
+                  name: 'lock',
+                  size: '0.7rem'
+                })
+              })
+            : null
         ]
       }),
       jsx('div', {
@@ -1998,7 +2486,7 @@ function BoardColumn({ column, now, onSelect, selectedId }) {
           tasks.length === 0
             ? jsx('span', { className: 'px-0.5 text-[0.6875rem] text-(--ui-text-quaternary)', children: '—' })
             : tasks.map(task =>
-                jsx(BoardCard, { now, onSelect, selected: task.id === selectedId, task }, task.id)
+                jsx(BoardCard, { columns, now, onMove, onSelect, selected: task.id === selectedId, task }, task.id)
               )
       })
     ]
@@ -2007,8 +2495,11 @@ function BoardColumn({ column, now, onSelect, selectedId }) {
 
 /** The whole board, one lane per status, scrolling sideways when it is wider
  *  than the page. The page owns the query — it needs the same cards to resolve
- *  a selection the running/recent list never carried. */
-function BoardColumns({ board, error, isLoading, now, onSelect, selectedId }) {
+ *  a selection the running list never carried. */
+function BoardColumns({ board, error, isLoading, now, onMove, onSelect, selectedId }) {
+  const columns = board?.columns ?? []
+  const names = useMemo(() => columns.map(column => column.name), [columns])
+
   if (error) {
     return jsx('div', {
       className: 'grid h-full place-items-center p-4',
@@ -2019,8 +2510,6 @@ function BoardColumns({ board, error, isLoading, now, onSelect, selectedId }) {
   if (isLoading && !board) {
     return jsx('div', { className: 'grid h-full place-items-center', children: jsx(Loader, {}) })
   }
-
-  const columns = board?.columns ?? []
 
   if (columns.every(column => (column.tasks?.length ?? 0) === 0)) {
     return jsx('div', {
@@ -2033,11 +2522,637 @@ function BoardColumns({ board, error, isLoading, now, onSelect, selectedId }) {
   }
 
   return jsx('div', {
-    className: 'flex h-full min-h-0 gap-3 overflow-x-auto px-4 py-3',
+    className: 'flex h-full min-h-0 gap-2 overflow-x-auto px-3 py-3',
     'data-slot': 'kanban-plus-columns',
     children: columns.map(column =>
-      jsx(BoardColumn, { column, now, onSelect, selectedId }, column.name)
+      jsx(BoardColumn, { column, columns: names, now, onMove, onSelect, selectedId }, column.name)
     )
+  })
+}
+
+// ── the task view ────────────────────────────────────────────────────────────
+// Core's task drawer, ported: the status menu and meta table, the per-task
+// model override, the description, the dependencies, comments, the activity
+// feed, the run history — and, where core stops, this plugin's two additions:
+// the worker context meter and a worker log that can take over the page.
+
+/** Turn a `task_events` row into a line an operator can read. The backend
+ *  stores machine payloads (`status` + `{"status":"ready"}`); rendering the raw
+ *  kind made the feed useless, so known kinds get prose with the payload folded
+ *  in and unknown ones fall back to `kind` plus compact `key=value` detail. */
+export function eventLabel(event) {
+  let payload = {}
+
+  if (typeof event?.payload === 'string' && event.payload) {
+    try {
+      payload = JSON.parse(event.payload)
+    } catch {
+      return { detail: event.payload, label: String(event.kind ?? '').replace(/_/g, ' ') }
+    }
+  } else if (event?.payload && typeof event.payload === 'object') {
+    payload = event.payload
+  }
+
+  const str = key => (typeof payload[key] === 'string' && payload[key] ? payload[key] : null)
+  const lane = key => {
+    const value = str(key)
+
+    return value ? columnMeta(value).label : null
+  }
+
+  switch (event?.kind) {
+    case 'created':
+      return { detail: str('assignee') ?? undefined, label: `Angelegt in ${lane('status') ?? '?'}` }
+    case 'status': {
+      const reason = str('reason')
+
+      return {
+        detail: reason === 'parent_reopened' ? `Übergeordneter Task wieder offen: ${str('parent') ?? ''}` : (reason ?? undefined),
+        label: `Verschoben nach ${lane('status') ?? '?'}`
+      }
+    }
+
+    case 'assigned': {
+      const assignee = str('assignee')
+
+      return { label: assignee ? `Zugewiesen an ${assignee}` : 'Zuweisung entfernt' }
+    }
+
+    case 'commented':
+      return { label: `Kommentar von ${str('author') ?? 'jemandem'}` }
+    case 'claimed':
+      return { label: str('source_status') === 'review' ? 'Zum Review übernommen' : 'Von einem Worker übernommen' }
+    case 'spawned':
+      return { detail: payload.pid != null ? `PID ${payload.pid}` : undefined, label: 'Worker gestartet' }
+    case 'completed':
+      return { label: 'Abgeschlossen' }
+    case 'blocked':
+      return { detail: str('reason') ?? undefined, label: 'Blockiert' }
+    case 'unblocked':
+      return { label: `Entblockt nach ${lane('status') ?? ''}` }
+    case 'reclaimed':
+      return { detail: str('reason') ?? undefined, label: 'Zurückgeholt' }
+    case 'specified':
+      return { label: 'Spezifiziert' }
+    case 'promoted':
+    case 'promoted_manual':
+      return { detail: str('reason') ?? undefined, label: 'Nach Ready befördert' }
+    case 'scheduled':
+      return { detail: str('reason') ?? undefined, label: 'Eingeplant' }
+    case 'archived':
+      return { label: 'Archiviert' }
+    case 'edited':
+      return { label: 'Bearbeitet' }
+    case 'reprioritized':
+      return { label: `Priorität auf ${payload.priority ?? '?'}` }
+    default: {
+      const detail = Object.entries(payload)
+        .filter(([, value]) => value != null && typeof value !== 'object')
+        .map(([key, value]) => `${key}=${String(value)}`)
+        .join(' ')
+
+      return { detail: detail || undefined, label: String(event?.kind ?? '').replace(/_/g, ' ') }
+    }
+  }
+}
+
+/** Outcomes that are a failure however the run got there. */
+const FAILED_RUN = ['crashed', 'failed', 'timed_out', 'gave_up']
+
+/** `4m` / `1h 12m` — how long a run took. */
+function runDuration(startedAt, endedAt) {
+  const from = parseMs(startedAt)
+  const to = parseMs(endedAt)
+
+  if (from === null || to === null || to < from) {
+    return ''
+  }
+
+  return formatElapsed(from, to)
+}
+
+/** Jira-style status control: the current lane, click to move it elsewhere. */
+function StatusMenu({ columns, disabled, onMove, status }) {
+  const meta = columnMeta(status)
+  const targets = moveTargets(columns, status)
+
+  return jsxs(DropdownMenu, {
+    children: [
+      jsx(DropdownMenuTrigger, {
+        asChild: true,
+        children: jsxs('button', {
+          className:
+            'inline-flex items-center gap-1.5 rounded px-2 py-1 text-[0.6875rem] font-semibold tracking-wide uppercase transition-[filter] hover:brightness-110 disabled:opacity-60',
+          disabled,
+          style: { background: `color-mix(in srgb, ${meta.tone} 15%, transparent)`, color: meta.tone },
+          type: 'button',
+          children: [
+            jsx('span', { className: 'size-1.5 rounded-full', style: { background: meta.tone } }),
+            meta.label,
+            jsx(Codicon, { name: 'chevron-down', size: '0.7rem' })
+          ]
+        })
+      }),
+      jsx(DropdownMenuContent, {
+        align: 'start',
+        children:
+          targets.length === 0
+            ? jsx(DropdownMenuItem, { disabled: true, children: 'Kein offenes Ziel' })
+            : targets.map(name =>
+                jsxs(
+                  DropdownMenuItem,
+                  {
+                    onSelect: () => onMove(name),
+                    children: [
+                      jsx('span', {
+                        className: 'size-2 rounded-full',
+                        style: { background: columnMeta(name).tone }
+                      }),
+                      columnMeta(name).label
+                    ]
+                  },
+                  name
+                )
+              )
+      })
+    ]
+  })
+}
+
+/** A textarea that matches the app's inputs without importing one — the SDK's
+ *  `Textarea` is not an export this plugin can rely on everywhere. */
+function PlainTextarea({ className, onChange, onKeyDown, placeholder, rows = 3, value }) {
+  return jsx('textarea', {
+    className: cn(
+      'w-full resize-y rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-quaternary)/40 px-2 py-1.5',
+      'text-[0.75rem] leading-relaxed text-foreground outline-none placeholder:text-(--ui-text-quaternary)',
+      'focus-visible:border-(--color-primary)',
+      className
+    ),
+    onChange,
+    onKeyDown,
+    placeholder,
+    rows,
+    value
+  })
+}
+
+/** The description: read by default, one button to edit it, saved with PATCH. */
+function DescriptionSection({ body, disabled, onSave }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  return jsx(Section, {
+    action: jsx(Button, {
+      'aria-label': editing ? 'Bearbeiten abbrechen' : 'Beschreibung bearbeiten',
+      disabled,
+      onClick: () => {
+        setDraft(body ?? '')
+        setEditing(!editing)
+      },
+      size: 'icon-xs',
+      variant: 'ghost',
+      children: jsx(Codicon, { name: editing ? 'close' : 'edit', size: '0.75rem' })
+    }),
+    label: 'Beschreibung',
+    children: editing
+      ? jsxs('div', {
+          className: 'flex flex-col gap-1.5',
+          children: [
+            jsx(PlainTextarea, {
+              className: 'min-h-24',
+              onChange: event => setDraft(event.target.value),
+              placeholder: 'Was soll der Worker tun?',
+              rows: 6,
+              value: draft
+            }),
+            jsx(Button, {
+              className: 'self-end',
+              disabled,
+              onClick: () => {
+                onSave(draft)
+                setEditing(false)
+              },
+              size: 'xs',
+              variant: 'secondary',
+              children: 'Speichern'
+            })
+          ]
+        })
+      : body
+        ? jsx(Prose, { children: body })
+        : jsx('p', { className: 'text-[0.75rem] text-(--ui-text-quaternary)', children: 'Keine Beschreibung.' })
+  })
+}
+
+/** Comments, plus the composer. A running worker picks new comments up from
+ *  its context, so this doubles as the way to nudge one mid-run. */
+function CommentsSection({ comments, disabled, onSubmit, running }) {
+  const [body, setBody] = useState('')
+
+  const submit = () => {
+    const trimmed = body.trim()
+
+    if (trimmed && !disabled) {
+      onSubmit(trimmed)
+      setBody('')
+    }
+  }
+
+  return jsxs(Section, {
+    label: `Kommentare${comments.length ? ` (${comments.length})` : ''}`,
+    children: [
+      comments.length > 0
+        ? jsx('ul', {
+            className: 'flex flex-col gap-2',
+            children: comments.map(comment =>
+              jsxs(
+                'li',
+                {
+                  className: 'text-[0.75rem]',
+                  children: [
+                    jsxs('div', {
+                      className: 'flex items-baseline gap-2',
+                      children: [
+                        jsx('span', {
+                          className: 'font-medium text-(--ui-text-secondary)',
+                          children: comment.author
+                        }),
+                        jsx('span', {
+                          className: 'text-[0.625rem] text-(--ui-text-quaternary)',
+                          children: formatStamp(comment.created_at)
+                        })
+                      ]
+                    }),
+                    jsx('p', {
+                      className: 'whitespace-pre-wrap text-(--ui-text-tertiary)',
+                      'data-selectable-text': 'true',
+                      children: comment.body
+                    })
+                  ]
+                },
+                comment.id
+              )
+            )
+          })
+        : null,
+      jsxs('div', {
+        className: 'flex flex-col gap-1.5',
+        children: [
+          jsx(PlainTextarea, {
+            onChange: event => setBody(event.target.value),
+            onKeyDown: event => {
+              if (isSubmitEnter(event) && !event.shiftKey) {
+                event.preventDefault()
+                submit()
+              }
+            },
+            placeholder: running ? 'Nachricht an den laufenden Worker…' : 'Kommentar hinzufügen…',
+            rows: 2,
+            value: body
+          }),
+          jsx(Button, {
+            className: 'self-end',
+            disabled: !body.trim() || disabled,
+            onClick: submit,
+            size: 'xs',
+            variant: 'secondary',
+            children: running ? 'Senden' : 'Kommentieren'
+          })
+        ]
+      })
+    ]
+  })
+}
+
+/** The per-task model override — the same picker the board model uses, writing
+ *  to this one task. Unset means the assigned profile's own model decides. */
+function TaskModelField({ disabled, onPatch, task }) {
+  const current = { model: task.model_override ?? '', provider: task.provider_override ?? '' }
+
+  return jsxs('div', {
+    className: 'flex items-center gap-1',
+    children: [
+      jsx(ModelPicker, {
+        ariaLabel: 'Modell dieses Tasks',
+        current,
+        disabled,
+        inheritCopy: MODEL_INHERIT,
+        onPick: (model, provider) => onPatch({ model_override: model, provider_override: provider }),
+        triggerClassName: 'h-6 min-w-0 flex-1 text-[0.71rem]'
+      }),
+      jsx(ClearModelButton, {
+        disabled,
+        label: 'Modell zurücksetzen',
+        onClear: () => onPatch({ clear_model_override: true }),
+        shown: Boolean(String(current.model).trim())
+      })
+    ]
+  })
+}
+
+/** Everything about the task that is a fact rather than prose. */
+function TaskMetaTable({ disabled, now, onPatch, task }) {
+  const startedMs = parseMs(task.started_at)
+  const running = task.status === 'running'
+  const rows = [
+    ['Worker', task.assignee || 'nicht zugewiesen'],
+    ['Priorität', typeof task.priority === 'number' ? String(task.priority) : ''],
+    ['Tenant', task.tenant],
+    ['Workspace', task.workspace_path ? `${task.workspace_kind ? `${task.workspace_kind}: ` : ''}${task.workspace_path}` : ''],
+    ['Branch', task.branch_name],
+    ['Angelegt von', task.created_by],
+    ['Angelegt', formatStamp(task.created_at)],
+    ['Gestartet', formatStamp(task.started_at)],
+    ['Laufzeit', running && startedMs !== null ? formatElapsed(startedMs, now) : ''],
+    ['Beendet', formatStamp(task.completed_at)],
+    ['Worker-PID', running && task.worker_pid ? String(task.worker_pid) : ''],
+    ['Fehlversuche', task.consecutive_failures ? String(task.consecutive_failures) : '']
+  ]
+
+  return jsxs('div', {
+    className: 'grid grid-cols-[5.5rem_minmax(0,1fr)] items-center gap-x-3 gap-y-1 text-[0.71rem]',
+    children: [
+      jsx(MetaRow, { label: 'Modell', children: jsx(TaskModelField, { disabled, onPatch, task }) }),
+      ...rows
+        .filter(([, value]) => Boolean(value))
+        .map(([label, value]) => jsx(MetaRow, { label, title: value, children: value }, label))
+    ]
+  })
+}
+
+/** The dependency chips: what blocks this task, and what it blocks. */
+function LinksSection({ links, onOpen }) {
+  const sides = [
+    ['parents', 'Blockiert von'],
+    ['children', 'Blockiert']
+  ].filter(([side]) => (links?.[side]?.length ?? 0) > 0)
+
+  if (sides.length === 0) {
+    return null
+  }
+
+  return jsx(Section, {
+    label: 'Abhängigkeiten',
+    children: jsx('div', {
+      className: 'flex flex-col gap-1',
+      children: sides.map(([side, label]) =>
+        jsxs(
+          'div',
+          {
+            className: 'flex flex-wrap items-center gap-1.5',
+            children: [
+              jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: label }),
+              ...links[side].map(id =>
+                jsx(
+                  'button',
+                  {
+                    className:
+                      'rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 font-mono text-[0.625rem] text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+                    onClick: () => onOpen(id),
+                    title: id,
+                    type: 'button',
+                    children: shortId(id)
+                  },
+                  id
+                )
+              )
+            ]
+          },
+          side
+        )
+      )
+    })
+  })
+}
+
+/** The activity feed, newest last — the order the events happened in. */
+function ActivitySection({ events }) {
+  if (!events.length) {
+    return null
+  }
+
+  return jsx(Section, {
+    label: `Aktivität (${events.length})`,
+    children: jsx('ul', {
+      className: 'flex max-h-40 flex-col gap-1 overflow-y-auto',
+      children: events.map(event => {
+        const { detail, label } = eventLabel(event)
+
+        return jsxs(
+          'li',
+          {
+            className: 'flex items-baseline gap-2 text-[0.6875rem]',
+            children: [
+              jsx('span', { className: 'shrink-0 text-(--ui-text-secondary)', children: label }),
+              detail
+                ? jsx('span', {
+                    className: 'min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)',
+                    title: detail,
+                    children: detail
+                  })
+                : null,
+              jsx('span', {
+                className: 'ml-auto shrink-0 text-[0.625rem] text-(--ui-text-quaternary)',
+                children: formatStamp(event.created_at)
+              })
+            ]
+          },
+          event.id
+        )
+      })
+    })
+  })
+}
+
+/** Every attempt at the task, with its outcome and handoff summary. */
+function RunsSection({ runs }) {
+  if (!runs.length) {
+    return null
+  }
+
+  return jsx(Section, {
+    label: `Läufe (${runs.length})`,
+    children: jsx('ul', {
+      className: 'flex max-h-56 flex-col gap-1.5 overflow-y-auto',
+      children: runs.map(run => {
+        const state = run.outcome ?? run.status
+        const failed = FAILED_RUN.includes(state)
+        const took = runDuration(run.started_at, run.ended_at)
+
+        return jsxs(
+          'li',
+          {
+            className: 'flex flex-col gap-0.5 text-[0.71rem]',
+            children: [
+              jsxs('div', {
+                className: 'flex items-center gap-2',
+                children: [
+                  jsx(Badge, { size: 'xs', variant: failed ? 'destructive' : 'muted', children: state }),
+                  run.profile ? jsx('span', { className: 'text-(--ui-text-tertiary)', children: run.profile }) : null,
+                  took ? jsx('span', { className: 'text-(--ui-text-quaternary)', children: took }) : null,
+                  jsx('span', {
+                    className: 'ml-auto shrink-0 text-(--ui-text-quaternary)',
+                    children: formatStamp(run.ended_at ?? run.started_at)
+                  })
+                ]
+              }),
+              run.error || run.summary
+                ? jsx('p', {
+                    className: cn(
+                      'line-clamp-3 whitespace-pre-wrap',
+                      run.error ? 'text-(--color-destructive,#e5484d)' : 'text-(--ui-text-quaternary)'
+                    ),
+                    children: run.error ?? run.summary
+                  })
+                : null
+            ]
+          },
+          run.id
+        )
+      })
+    })
+  })
+}
+
+// `latest_summary` is just the newest non-null run summary, and a reclaim parks
+// an administrative note in that slot. Those read as noise in the detail view;
+// the run history still shows them.
+const ADMIN_SUMMARY_RE = /^status changed to \w+ \(dashboard\/direct\)$/
+
+/**
+ * The task view: everything core's drawer shows, plus the worker context meter
+ * and the small worker log whose four-arrow button takes over the page.
+ */
+function TaskDetailPanel({ card, columns, onClose, onExpandLog, onOpen, taskId }) {
+  const qc = useQueryClient()
+  const slug = useValue($boardSlug)
+  const move = useTaskMove()
+
+  const {
+    data: detail,
+    error,
+    isLoading
+  } = useQuery({
+    enabled: Boolean(taskId),
+    queryFn: () => fetchTaskDetail(taskId),
+    queryKey: taskKey(slug, taskId ?? ''),
+    refetchInterval: card?.status === 'running' ? 10_000 : 30_000
+  })
+
+  const invalidate = () => refreshAll(qc)
+
+  const patch = useMutation({
+    mutationFn: fields => patchTask(taskId, fields),
+    onError: err => host.notifyError(err, 'Task konnte nicht geändert werden'),
+    onSettled: invalidate
+  })
+
+  const comment = useMutation({
+    mutationFn: body => postComment(taskId, body),
+    onError: err => host.notifyError(err, 'Kommentar konnte nicht gespeichert werden'),
+    onSettled: invalidate
+  })
+
+  // The card carries enough to draw the header while the detail is in flight,
+  // so the panel never opens as an empty box.
+  const task = detail?.task ?? card
+  const running = task?.status === 'running'
+  const busy = patch.isPending || move.isPending
+  const now = Date.now()
+
+  useTicker(running, 1_000)
+
+  return jsxs('aside', {
+    className:
+      'flex w-96 max-w-[55%] shrink-0 flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated)',
+    'data-slot': 'kanban-plus-task',
+    children: [
+      jsxs('header', {
+        className: 'flex shrink-0 flex-col gap-2 border-b border-(--ui-stroke-tertiary) px-4 pt-3 pb-2.5',
+        children: [
+          jsxs('div', {
+            className: 'flex items-center gap-2',
+            children: [
+              task
+                ? jsx(StatusMenu, {
+                    columns,
+                    disabled: busy,
+                    onMove: status => move.mutate({ id: taskId, status }),
+                    status: task.status
+                  })
+                : null,
+              jsx('span', {
+                className: 'min-w-0 truncate font-mono text-[0.625rem] text-(--ui-text-quaternary)',
+                'data-selectable-text': 'true',
+                title: taskId,
+                children: taskId
+              }),
+              jsx(Button, {
+                'aria-label': 'Task-Details schließen',
+                className: 'ml-auto shrink-0',
+                onClick: onClose,
+                size: 'icon-xs',
+                variant: 'ghost',
+                children: jsx(Codicon, { name: 'close', size: '0.85rem' })
+              })
+            ]
+          }),
+          jsx('h2', {
+            className: 'text-sm leading-snug font-semibold text-foreground',
+            'data-selectable-text': 'true',
+            children: task?.title || taskId
+          })
+        ]
+      }),
+      jsx('div', {
+        className: 'min-h-0 flex-1 overflow-y-auto px-4 pt-3 pb-4',
+        children: error
+          ? jsx(ErrorState, { description: errText(error), title: 'Task konnte nicht geladen werden' })
+          : isLoading && !detail
+            ? jsx('div', { className: 'grid h-32 place-items-center', children: jsx(Loader, {}) })
+            : jsxs('div', {
+                className: 'flex flex-col gap-4',
+                children: [
+                  jsx(TaskMetaTable, { disabled: busy, now, onPatch: fields => patch.mutate(fields), task }),
+                  jsx(TaskContextMeter, { running, taskId }),
+                  jsx(DescriptionSection, {
+                    body: task?.body,
+                    disabled: busy,
+                    onSave: body => patch.mutate({ body })
+                  }),
+                  task?.result
+                    ? jsx(Section, { label: 'Ergebnis', children: jsx(Prose, { children: task.result }) })
+                    : null,
+                  task?.latest_summary && !ADMIN_SUMMARY_RE.test(task.latest_summary)
+                    ? jsx(Section, {
+                        label: 'Letzte Zusammenfassung',
+                        children: jsx(Prose, { children: task.latest_summary })
+                      })
+                    : null,
+                  task?.last_failure_error
+                    ? jsx(Section, {
+                        label: 'Letzter Fehler',
+                        children: jsx('p', {
+                          className: 'whitespace-pre-wrap text-[0.75rem] text-(--color-destructive,#e5484d)',
+                          children: task.last_failure_error
+                        })
+                      })
+                    : null,
+                  jsx(LinksSection, { links: detail?.links, onOpen }),
+                  jsx(TaskLogSection, { onExpand: onExpandLog, task: task ?? { id: taskId } }),
+                  jsx(CommentsSection, {
+                    comments: detail?.comments ?? [],
+                    disabled: comment.isPending,
+                    onSubmit: body => comment.mutate(body),
+                    running
+                  }),
+                  jsx(ActivitySection, { events: detail?.events ?? [] }),
+                  jsx(RunsSection, { runs: detail?.runs ?? [] })
+                ]
+              })
+      })
+    ]
   })
 }
 
@@ -2046,8 +3161,12 @@ function BoardColumns({ board, error, isLoading, now, onSelect, selectedId }) {
 function KanbanPlusPage() {
   const slug = useValue($boardSlug)
   const [selectedId, setSelectedId] = useState(() => readSelectedTask($boardSlug.get()))
+  // The worker log, blown up over the whole page. Off by default; Esc and the
+  // same four-arrow button both put the task's details back.
+  const [logExpanded, setLogExpanded] = useState(false)
   // Which board already got its one automatic "land on a running task".
   const autoLanded = useRef('')
+  const move = useTaskMove()
 
   // A task id belongs to the board it came from, so a switch re-reads THAT
   // board's remembered selection instead of pointing at a task it never had.
@@ -2081,14 +3200,19 @@ function KanbanPlusPage() {
 
   const running = useMemo(() => tasks?.running ?? [], [tasks])
   const recent = useMemo(() => tasks?.recent ?? [], [tasks])
+  const columnNames = useMemo(() => {
+    const names = (board?.columns ?? []).map(column => column.name)
+
+    return names.length > 0 ? names : BOARD_COLUMN_ORDER
+  }, [board])
 
   // One ticker for the whole list: N running rows must not mean N intervals.
   useTicker(running.length > 0, 1_000)
 
   const now = Date.now()
 
-  // A card can sit in a lane the running/recent list does not reach (an old
-  // Todo, say), and picking one still has to open its log.
+  // A card can sit in a lane the running list does not reach (an old Todo,
+  // say), and picking one still has to open its details.
   const selected = useMemo(() => {
     const cards = (board?.columns ?? []).flatMap(column => column.tasks ?? [])
 
@@ -2098,14 +3222,18 @@ function KanbanPlusPage() {
   const select = id => {
     setSelectedId(id)
     writeSelectedTask(slug, id)
+
+    if (!id) {
+      setLogExpanded(false)
+    }
   }
 
   // Nothing resolved (first open, or a remembered id whose task was pruned) and
   // something IS running: land on it rather than leaving the panel on a dead
   // selection. Only runs once the first task payload arrived — before that an
   // empty `running` says nothing about whether the id is still valid. Once per
-  // board, so closing the log keeps the lanes full height instead of having the
-  // next poll re-open it.
+  // board, so closing the panel keeps the lanes full width instead of having
+  // the next poll re-open it.
   useEffect(() => {
     if (tasks && !selected && running.length > 0 && autoLanded.current !== slug) {
       autoLanded.current = slug
@@ -2114,6 +3242,31 @@ function KanbanPlusPage() {
     // `select` is stable enough (it only wraps two setters) to leave out.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running, selected, slug, tasks])
+
+  // Esc unwinds one layer at a time: the big log first, then the task view —
+  // the same order the reader opened them in.
+  useEffect(() => {
+    if (!selectedId) {
+      return undefined
+    }
+
+    const onKey = event => {
+      if (event.key !== 'Escape' || event.defaultPrevented) {
+        return
+      }
+
+      if (logExpanded) {
+        setLogExpanded(false)
+      } else {
+        select(null)
+      }
+    }
+
+    window.addEventListener('keydown', onKey)
+
+    return () => window.removeEventListener('keydown', onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [logExpanded, selectedId, slug])
 
   if (stateError) {
     return jsx('div', {
@@ -2131,19 +3284,18 @@ function KanbanPlusPage() {
   const since = formatStamp(state?.stopped_at)
 
   return jsxs('div', {
-    className: 'flex h-full min-h-0 flex-col bg-(--ui-surface-background)',
+    className: 'relative flex h-full min-h-0 flex-col bg-(--ui-surface-background)',
     'data-slot': 'kanban-plus-page',
     children: [
-      // Page-owned header chrome: exists exactly while this page is mounted.
-      jsx(Contribute, {
-        area: WORKSPACE_PAGE_HEADER_AREA,
-        id: 'kanban-plus:board-switcher',
-        children: jsx(BoardSwitcher, {})
-      }),
       jsxs('header', {
         className: 'flex shrink-0 flex-wrap items-center gap-2 px-4 pt-3 pb-2',
         children: [
-          jsx('h1', { className: 'text-sm font-semibold text-foreground', children: 'Kanban+' }),
+          jsx('h1', { className: 'shrink-0 text-sm font-semibold text-foreground', children: 'Kanban+' }),
+          // In the page's OWN header, not the workspace's contributed header
+          // band: that band belongs to the main workspace pane, so a page
+          // opened as a split tile (right-click the sidebar row ▸ Open in
+          // split) never rendered it and lost the switcher entirely.
+          jsx(BoardSwitcher, {}),
           jsxs(Badge, {
             size: 'xs',
             variant: stopped ? 'destructive' : 'success',
@@ -2180,55 +3332,50 @@ function KanbanPlusPage() {
       jsxs('div', {
         className: 'flex min-h-0 flex-1 border-t border-(--ui-stroke-tertiary)',
         children: [
-          jsx('aside', {
-            className: 'w-72 shrink-0 overflow-y-auto border-r border-(--ui-stroke-tertiary)',
-            children:
-              running.length === 0 && recent.length === 0
-                ? jsx(EmptyState, { description: 'Weder laufende noch kürzlich beendete Tasks.', title: 'Keine Tasks' })
-                : jsxs(Fragment, {
-                    children: [
-                      jsx(TaskGroup, { label: 'Laufend', now, onSelect: select, selectedId, tasks: running }),
-                      jsx(TaskGroup, { label: 'Zuletzt', now, onSelect: select, selectedId, tasks: recent })
-                    ]
-                  })
+          // Only the running workers: the lanes already carry everything else,
+          // and this list adds what they cannot — a live clock per worker.
+          running.length > 0
+            ? jsx('aside', {
+                className: 'w-60 shrink-0 overflow-y-auto border-r border-(--ui-stroke-tertiary)',
+                children: jsx(TaskGroup, { label: 'Laufend', now, onSelect: select, selectedId, tasks: running })
+              })
+            : null,
+          // The lanes own the page; the task view opens beside them for the
+          // card the reader picked, and gives the space back on close.
+          jsx('div', {
+            className: 'min-h-0 min-w-0 flex-1',
+            children: jsx(BoardColumns, {
+              board,
+              error: boardError,
+              isLoading: boardLoading,
+              now,
+              onMove: (id, status) => move.mutate({ id, status }),
+              onSelect: select,
+              selectedId
+            })
           }),
-          // The lanes own the page; the log opens underneath them for the card
-          // (or list row) the reader picked, and gives the space back on close.
-          jsxs('div', {
-            className: 'flex min-h-0 min-w-0 flex-1 flex-col',
-            children: [
-              jsx('div', {
-                className: 'min-h-0 flex-1',
-                children: jsx(BoardColumns, {
-                  board,
-                  error: boardError,
-                  isLoading: boardLoading,
-                  now,
-                  onSelect: select,
-                  selectedId
-                })
-              }),
-              selected
-                ? jsxs('div', {
-                    className: 'flex h-2/5 min-h-0 shrink-0 flex-col border-t border-(--ui-stroke-tertiary)',
-                    children: [
-                      jsx(WorkerLogPanel, { task: selected }, selected.id),
-                      jsx('div', {
-                        className: 'shrink-0 border-t border-(--ui-stroke-tertiary) px-4 py-1 text-right',
-                        children: jsx(Button, {
-                          onClick: () => select(null),
-                          size: 'sm',
-                          variant: 'text',
-                          children: 'Log schließen'
-                        })
-                      })
-                    ]
-                  })
-                : null
-            ]
-          })
+          selectedId
+            ? jsx(
+                TaskDetailPanel,
+                {
+                  card: selected,
+                  columns: columnNames,
+                  onClose: () => select(null),
+                  onExpandLog: () => setLogExpanded(true),
+                  onOpen: select,
+                  taskId: selectedId
+                },
+                selectedId
+              )
+            : null
         ]
-      })
+      }),
+      logExpanded && (selected || selectedId)
+        ? jsx(LogOverlay, {
+            onClose: () => setLogExpanded(false),
+            task: selected ?? { id: selectedId, status: 'unknown', title: selectedId }
+          })
+        : null
     ]
   })
 }
