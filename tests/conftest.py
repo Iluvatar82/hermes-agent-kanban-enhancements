@@ -58,6 +58,13 @@ def pkg():
 
 
 @pytest.fixture
+def plugin_dir():
+    """The package directory — for tests that import a SECOND copy of it, the
+    way a multi-profile gateway does."""
+    return PLUGIN_DIR
+
+
+@pytest.fixture
 def board_root(tmp_path, monkeypatch):
     """Point the plugin's board-scoped state and logs at a temp directory."""
     kb = plugin.core.kanban_db()

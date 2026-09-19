@@ -1,5 +1,5 @@
 name: kanban-enhancements
-version: 0.3.0
+version: 0.4.0
 description: "Operator controls for the Hermes kanban board: stop/start the whole board, a live cap on parallel runs, per-line worker-log timestamps, worker context-window snapshots, and a desktop page that shows all of it."
 author: "Franz Spitaler"
 license: MIT
@@ -18,6 +18,7 @@ tags:
   - desktop
 provides_hooks:
   - post_llm_call
+  - on_kanban_dispatch_tick
 config_schema:
   stop_terminates_workers:
     type: boolean

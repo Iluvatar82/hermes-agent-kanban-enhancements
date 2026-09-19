@@ -7,17 +7,17 @@ patched core files, no desktop rebuild.
 | | |
 |---|---|
 | **Separate boards** | The board switcher core's Kanban page has, in the Kanban+ page header: switch between boards, create one (scoped to a Hermes project), rename it, export and import it, archive it. Every control here — the stop switch, the board model, the logs — then applies to the board you picked, and the pick survives a restart. |
-| **The board's columns** | The lanes themselves — *Triage, Todo, Geplant, Ready, Läuft, Blockiert, Review, Fertig* — with their cards. |
+| **The board's columns** | The lanes themselves — *Triage, Todo, Geplant, Ready, Läuft, Blockiert, Review, Fertig* — with their cards. Like core's board, a lane folds to a rail: empty ones fold on their own, occupied ones open on their own, the chevron in the header (or a click on the rail) overrides that, and a folded rail still takes a drop. |
 | **Drag & drop, and a card menu** | Drag a card into another lane, or right-click it and pick one. The lanes the dispatcher owns (*Läuft, Review, Geplant*) refuse the drop instead of failing after it, and the move itself goes through core's own transition rules — a running worker is reclaimed, a *Ready* that a parent still blocks is refused with the reason. |
-| **A full task view** | Core's task drawer, beside the lanes: status menu, worker, per-task model override, description (editable), result and last summary, dependencies, comments, activity, run history — plus the worker log and the context meter. |
+| **A full task view** | Core's task drawer, over the lanes on the right — a third of the board wide, never narrower than 22rem: status menu, worker, per-task model override, description (editable), result and last summary, dependencies, comments, activity, run history — plus a 200px worker log and the context meter. |
 | **A log that takes over the page** | The four-arrow button above the small log blows it up over the whole page, with every line's timestamp and the day dividers. `Esc` (or the button again) gives the task details back. |
 | **Stop the whole board** | One switch that persists. Running workers are reclaimed (tasks go back to *ready*), and nothing dispatches again — not the gateway tick, not the CLI, not the desktop nudge — until you start the board. It survives gateway and app restarts, so a restart never silently resumes work. |
 | **A live cap on parallel runs** | `kanban.max_in_progress` is re-read on every tick, so changing it needs no restart, and `0` finally means *explicitly unbounded* instead of falling back to the memory-derived default. |
-| **A model for the whole board** | Pick one model and every task run *and* the auto-composer (decompose / specify) use it. A task that pins its own model keeps it. Unset = every profile uses its own model, exactly like the per-task override. |
+| **A model for the whole board** | Pick one model and every task run *and* the auto-composer (decompose / specify) use it. A task that pins its own model keeps it. Unset = every profile uses its own model, exactly like the per-task override. The seams it needs are re-attached on every dispatcher tick, so a gateway that could not patch them at boot repairs itself instead of running the wrong model until the next restart. |
 | **Timestamped worker logs** | Workers prefix every log line with the time they wrote it. Every existing reader keeps the classic format — the stamps are stripped unless a caller asks for them. |
 | **Updates from the page** | Kanban+ compares what is running, what is on disk and what its source repository has, and updates itself with one button. It knows the difference between *there is a new version* and *the new version is already installed and the gateway has not loaded it yet*. |
 | **Worker context snapshots** | Each worker writes how full its context window is next to its log, so you can see it from outside the process. |
-| **A desktop page** | `Kanban+` in the sidebar: the board switcher, the board's columns, board state, the controls above and the task view. Works the same opened as a split tile (right-click the sidebar row ▸ *Open in split*). Plus a status-bar pill, three command-palette entries and a context-fill strip above the chat composer. |
+| **A desktop page** | `Kanban+` in the sidebar: the board switcher, the board's columns, board state, the controls above and the task drawer. Works the same opened as a split tile (right-click the sidebar row ▸ *Open in split*). Plus a status-bar pill, three command-palette entries and a context-fill strip above the chat composer. |
 
 The desktop UI is currently German-only. Everything else (CLI, API, logs) is English.
 
@@ -63,7 +63,7 @@ Two things it deliberately does not hide:
   script below.
 - **The gateway keeps serving the old code until it restarts.** Installing replaces the directory
   the backend was imported from, so the row switches to *installiert — Gateway neu starten* until
-  you do. That is also why the version line can read `Kanban+ 0.3.0 → 0.4.0`: running, then
+  you do. That is also why the version line can read `Kanban+ 0.4.0 → 0.5.0`: running, then
   installed.
 
 The update *check* is one HTTPS request to `raw.githubusercontent.com` for the manifest. Set
@@ -113,11 +113,17 @@ Below it the board's **columns** with their cards. **Drag** a card into another 
 **right-click** it for *Details öffnen · Verschieben nach … · Task-ID kopieren*. *Läuft*, *Review*
 and *Geplant* are the dispatcher's and show a lock rather than accepting a drop.
 
-Clicking a card opens the **task view** beside the lanes: the status menu (the third way to move a
-task), worker, the per-task model override, the description (editable), result, last summary,
-dependencies, comments, activity, run history, the worker context meter and the worker log. The
-four-arrow button above that log blows it up over the whole page — every line with its timestamp,
-scrollable — and `Esc` brings the details back. `Esc` again closes the task view.
+Clicking a card opens the **task drawer** over the right of the board — a third of the width, never
+below 22rem, so the lanes keep theirs: the status menu (the third way to move a task), worker, the
+per-task model override, the description (editable), result, last summary, dependencies, comments,
+activity, run history, the worker context meter and the worker log. The four-arrow button above that
+log blows it up over the Kanban+ page — every line with its timestamp, wrapped, scrolling only
+vertically — and `Esc` brings the details back. `Esc` again closes the drawer.
+
+A lane with no cards shows as a **rail** you can still drop onto; one with cards is open. The
+chevron in a lane header folds it by hand, a click on a rail unfolds it, and that choice lasts until
+the lane fills or empties — then the automatic rule takes over again. The choices are remembered per
+install.
 
 The status-bar pill shows the picked board's state and opens stop/start; ⌘K/Ctrl+K has *Kanban:
 Board stoppen / starten / Board-Seite öffnen*.
@@ -157,7 +163,7 @@ the active board.
 | `POST /boards/{slug}/switch` | Persist the board as active (CLI parity; the page picks client-side) |
 | `GET /projects` | Live Hermes projects, for scoping a board |
 | `GET /board` `?include_archived=` | The board grouped into its status columns — what the page draws |
-| `GET /state` | Board switch, running workers, cap, board model, and whether the core hooks are active |
+| `GET /state` | Board switch, running workers, cap, board model, and whether the core hooks are active (re-attaching any that are not) |
 | `POST /stop` `{reason?}` | Stop the board, reclaim running workers |
 | `POST /start` | Start the board and dispatch once |
 | `PUT /max-parallel` `{value}` | Write `kanban.max_in_progress` (`0` = unbounded) |
@@ -197,6 +203,10 @@ board from spawning. This plugin therefore wraps three core functions at load ti
 | `kanban_db_dispatch._default_spawn` | The board model for task runs |
 | `agent.auxiliary_client.call_llm` | The board model for the auto-composer (only for the `kanban_decomposer` / `triage_specifier` tasks) |
 
+The composer wrapper takes no board argument and needs none: core's auto-decomposer pins
+`HERMES_KANBAN_BOARD` around the call and `get_current_board()` reads it, so the model resolves to
+the board being decomposed rather than whichever one was switched to last.
+
 `PATCH /tasks/{id}` is a fourth seam, and a gentler one: it **calls** core's own kanban plugin API
 (`plugins/kanban/dashboard/plugin_api.py`, already mounted in the same process) rather than
 re-implementing a status transition out of its private helpers. Reclaiming a running worker,
@@ -214,12 +224,31 @@ snapshots, the log view — keeps working, because those use documented plugin h
 
 If you hit that, please open an issue with your Hermes version.
 
+### Why the patches are retried, and where the flag lives
+
+All three seams used to be attached exactly once, from `register()`, and the fact that they were
+attached was a module global. Both were wrong:
+
+- **Once is too early.** `register()` runs during gateway boot, which is the one moment
+  `hermes_cli.kanban_db_dispatch` and (especially) `agent.auxiliary_client` may not import yet. A
+  "not yet" was recorded as a "never", and the board model stayed inert for the life of the process.
+- **A module global is not the process.** `plugins_loader` gives every Hermes home its own module
+  name, so a gateway serving several profiles imports this package several times. Each copy had its
+  own flags, and `GET /state` read whichever copy the dashboard API found — reporting
+  `guard_active: false` and *"board model set but patches nowhere"* while the real patches were live
+  in another copy.
+
+So the flag is now an attribute on the patched function (`core.PATCH_MARKER`), which every copy can
+read, and installing is idempotent and retried: at load, once per `on_kanban_dispatch_tick`, on
+every `GET /state`, and on `hermes kanban-plus status`. A copy that finds a seam already patched
+leaves it alone, and an uninstall only ever unwraps its own wrapper.
+
 ## Development
 
 ```bash
 git clone https://github.com/Iluvatar82/hermes-agent-kanban-enhancements
 cd hermes-agent-kanban-enhancements
-HERMES_AGENT_REPO=/path/to/hermes-agent pytest    # 84 tests against a real checkout
+HERMES_AGENT_REPO=/path/to/hermes-agent pytest    # 98 tests against a real checkout
 node --test tests/desktop/*.test.mjs              # the desktop helpers, with stubbed SDK
 ruff check .
 ```
@@ -228,6 +257,13 @@ The Python tests import the plugin exactly the way Hermes does and exercise the 
 real Hermes checkout rather than a stub; without `HERMES_AGENT_REPO` (or a checkout in the default
 location) they skip. `tests/test_manifest.py` checks `plugin.yaml` against that checkout's own
 installer and loader — a manifest the installed Hermes refuses is a plugin nobody can install.
+
+`tests/test_desktop_classes.py` is the same idea for CSS. **Tailwind v4 generates the app's
+stylesheet by scanning source at build time, and a plugin loaded from disk at runtime is not in
+that scan** — so a class works here only if Hermes' own source contains the same string. An
+invented arbitrary value (`w-96`, `max-w-[55%]`, `h-[3px]`) produces no rule at all and fails
+silently; the test checks every arbitrary class in `plugin.js` against the checkout. Anything
+load-bearing goes in an inline `style` instead, where nothing has to be generated for it to apply.
 
 ```
 kanban-enhancements/      the installable package (this is what lands in $HERMES_HOME/plugins/)

@@ -264,6 +264,87 @@ describe('the picked board', () => {
     disposers.forEach(dispose => dispose())
     plugin.$boardSlug.set('')
   })
+
+  it('remembers the lanes the reader folded, and survives a junk value', () => {
+    const stored = { collapsedLanes: { done: false } }
+    const disposers = []
+    const ctx = {
+      onDispose: fn => disposers.push(fn),
+      register() {},
+      registerMany() {},
+      rest: async () => ({}),
+      storage: { get: (key, fallback) => stored[key] ?? fallback, set: (key, value) => { stored[key] = value } }
+    }
+
+    plugin.default.register(ctx)
+    assert.deepEqual(plugin.$collapsedLanes.get(), { done: false })
+
+    plugin.$collapsedLanes.set({ todo: true })
+    assert.deepEqual(stored.collapsedLanes, { todo: true })
+
+    disposers.forEach(dispose => dispose())
+
+    // A storage that hands back something that is not a map must not become
+    // the atom's value — every read of it would then throw on the board page.
+    stored.collapsedLanes = 'corrupted'
+    plugin.default.register(ctx)
+    assert.deepEqual(plugin.$collapsedLanes.get(), {})
+
+    disposers.forEach(dispose => dispose())
+    plugin.$collapsedLanes.set({})
+    plugin.$boardSlug.set('')
+  })
+})
+
+describe('collapsed lanes', () => {
+  const lane = (name, count) => ({ name, tasks: Array.from({ length: count }, (_, i) => ({ id: `${name}-${i}` })) })
+
+  it('collapses an empty lane and opens an occupied one, with no state at all', () => {
+    assert.equal(plugin.laneCollapsed({}, lane('done', 0)), true)
+    assert.equal(plugin.laneCollapsed({}, lane('todo', 2)), false)
+    assert.equal(plugin.laneCollapsed({}, { name: 'todo' }), true)
+  })
+
+  it('lets an override win over the rule, either way', () => {
+    assert.equal(plugin.laneCollapsed({ done: false }, lane('done', 0)), false)
+    assert.equal(plugin.laneCollapsed({ todo: true }, lane('todo', 2)), true)
+  })
+
+  it('records a click as a deviation, and a click back as no entry at all', () => {
+    const opened = plugin.toggleLane({}, 'done', true)
+    assert.deepEqual(opened, { done: false })
+    assert.deepEqual(plugin.toggleLane(opened, 'done', true), {}, 'back to automatic leaves nothing behind')
+
+    const closed = plugin.toggleLane({}, 'todo', false)
+    assert.deepEqual(closed, { todo: true })
+    assert.deepEqual(plugin.toggleLane(closed, 'todo', false), {})
+  })
+
+  it('signs the board by which lanes are empty', () => {
+    assert.equal(plugin.lanePhase([lane('triage', 0), lane('todo', 1)]), 'triage:empty|todo:full')
+    assert.equal(plugin.lanePhase(undefined), '')
+  })
+
+  it('drops an override only for the lane whose emptiness flipped', () => {
+    const overrides = { todo: true, done: false }
+    const before = 'todo:full|done:empty'
+    const after = 'todo:full|done:full' // a card was dragged into Fertig
+
+    assert.deepEqual(plugin.pruneStaleLanes(overrides, before, after), { todo: true })
+  })
+
+  it('keeps every override while nothing moved, and on the first render', () => {
+    const overrides = { todo: true }
+
+    assert.equal(plugin.pruneStaleLanes(overrides, 'todo:full', 'todo:full'), overrides)
+    assert.equal(plugin.pruneStaleLanes(overrides, null, 'todo:empty'), overrides)
+  })
+
+  it('leaves a lane the board has never shown before alone', () => {
+    const overrides = { todo: true }
+
+    assert.deepEqual(plugin.pruneStaleLanes(overrides, 'done:empty', 'done:empty|todo:full'), { todo: true })
+  })
 })
 
 describe('board names', () => {
@@ -463,5 +544,75 @@ describe('element construction', () => {
     assert.deepEqual(missing, [])
     // A guard that finds nothing because its patterns broke is worse than none.
     assert.ok(used.length > 20 && declared.has('Codicon') && declared.has('TaskDetailPanel'))
+  })
+})
+
+// The page's layout rules are load-bearing and invisible to a unit test that
+// never renders: the drawer must float OVER the lanes rather than take a column
+// from them, and nothing may scroll the page sideways. They are read off the
+// source for the same reason the two guards above are.
+describe('page layout', () => {
+  const source = readFileSync(pluginFile, 'utf8')
+
+  /** The element whose `data-slot` is `slot`, from its opening jsx call to it. */
+  const slotElement = slot => {
+    const at = source.indexOf(`'data-slot': '${slot}'`)
+
+    assert.ok(at > 0, `no element carries data-slot="${slot}"`)
+
+    return source.slice(Math.max(0, at - 900), at)
+  }
+
+  it('floats the task drawer over the board, a third wide with a floor', () => {
+    const drawer = slotElement('kanban-plus-task')
+
+    assert.match(drawer, /absolute inset-y-0 right-0/, 'the drawer is positioned, not a flex column')
+    assert.match(source, /width: 'min\(100%, max\(22rem, 33\.3333%\)\)'/)
+    // min-width would beat max-width in CSS and overflow a narrow pane — the
+    // floor has to live inside the min() instead.
+    assert.doesNotMatch(source, /minWidth:/, 'the floor belongs in the width expression')
+  })
+
+  // Tailwind scans source at BUILD time and never sees this file, so a class it
+  // does not already generate for the app produces no rule at all. Sizes that
+  // decide the layout are therefore inline, where nothing has to be generated.
+  it('never bets the layout on an arbitrary class Hermes may not emit', () => {
+    // Comments talk ABOUT these classes; only the ones that ship count.
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    const invented = [...code.matchAll(/\b(?:w|h|min-w|min-h|max-w|max-h)-[[(][^'"\s]*/g)].map(m => m[0])
+
+    assert.deepEqual(invented, [], 'put load-bearing sizes in an inline style instead')
+  })
+
+  it('clips the board area so neither the drawer nor the lanes escape it', () => {
+    const page = slotElement('kanban-plus-page')
+
+    assert.match(page, /relative flex h-full min-h-0 flex-col overflow-hidden/)
+    assert.match(source, /relative flex min-h-0 flex-1 overflow-hidden border-t/)
+  })
+
+  it('never scrolls the worker log sideways', () => {
+    for (const slot of ['kanban-plus-log-overlay']) {
+      assert.match(slotElement(slot), /overflow-hidden/)
+    }
+
+    // Both log scrollers: lines wrap, so the only scrollbar is the vertical one.
+    assert.equal([...source.matchAll(/overflow-x-hidden overflow-y-auto/g)].length, 2)
+    assert.doesNotMatch(source, /className: '[^']*\boverflow-auto\b/, 'no scroller may scroll both ways')
+  })
+
+  it('shows nothing to the left of the lanes', () => {
+    const lanes = source.indexOf("'data-slot': 'kanban-plus-columns'")
+    const page = source.indexOf("'data-slot': 'kanban-plus-page'")
+
+    assert.ok(page > 0 && lanes > 0)
+    // The running-worker rail is gone: the lanes already carry those cards, in
+    // Läuft, and a second copy of them cost the board a column.
+    assert.doesNotMatch(source, /TaskGroup|TaskRow/, 'the running list is gone, not just unmounted')
+    assert.doesNotMatch(source, /border-r border-\(--ui-stroke-tertiary\)'/)
+  })
+
+  it('gives the drawer log a real height', () => {
+    assert.match(source, /const SMALL_LOG_STYLE = \{ maxHeight: '\d+rem', minHeight: '200px' \}/)
   })
 })

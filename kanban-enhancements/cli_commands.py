@@ -9,6 +9,14 @@ import sys
 from . import board_control, board_model, core, dispatch_guard, worker_context
 
 
+def _ensure_patches() -> None:
+    """The package's own ``ensure_patches``, imported lazily to keep this module
+    free of a cycle back into ``__init__``."""
+    from . import ensure_patches
+
+    ensure_patches()
+
+
 def _conn(board: str | None = None):
     """Connection to ``--board``'s own database — separate boards are separate
     databases, so the current one must never answer for the chosen one."""
@@ -23,7 +31,9 @@ def _board(args: argparse.Namespace) -> str | None:
 
 def _print_state(state, cap, running: int, as_json: bool) -> None:
     if as_json:
-        print(json.dumps({**state.as_dict(), "effective_max_in_progress": cap, "running": running}))
+        print(json.dumps({**state.as_dict(), "effective_max_in_progress": cap, "running": running,
+                          "guard_active": dispatch_guard.is_installed(),
+                          "model_patches": board_model.is_installed()}))
         return
     mode = "STOPPED" if state.stopped else "running"
     print(f"Board {state.board}: {mode}")
@@ -36,6 +46,12 @@ def _print_state(state, cap, running: int, as_json: bool) -> None:
           + (f" (provider {chosen.provider})" if chosen.provider else ""))
     if not dispatch_guard.is_installed():
         print("  ! dispatcher guard inactive — stop/start and the cap are NOT enforced")
+    # Only worth a word when a model is set: without one, "not patched" costs
+    # nothing because there is nothing to apply.
+    patches = board_model.is_installed()
+    if chosen.is_set and not all(patches.values()):
+        missing = ", ".join(name for name, ok in patches.items() if not ok)
+        print(f"  ! board model NOT applied ({missing}) — this process could not patch those seams")
 
 
 def _running_count(conn) -> int:
@@ -45,6 +61,9 @@ def _running_count(conn) -> int:
 
 def _cmd_status(args) -> int:
     board = _board(args)
+    # Repair first, report second — the same self-healing pass GET /state runs,
+    # so `status` never describes a seam it could have re-attached.
+    _ensure_patches()
     with _conn(board) as conn:
         _print_state(board_control.get_state(board), dispatch_guard.effective_cap(),
                      _running_count(conn), bool(getattr(args, "json", False)))
