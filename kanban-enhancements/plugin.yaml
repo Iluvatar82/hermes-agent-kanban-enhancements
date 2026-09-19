@@ -1,0 +1,31 @@
+name: kanban-enhancements
+version: 0.1.0
+description: "Operator controls for the Hermes kanban board: stop/start the whole board, a live cap on parallel runs, per-line worker-log timestamps, worker context-window snapshots, and a desktop page that shows all of it."
+author: "Franz Spitaler"
+license: MIT
+homepage: "https://github.com/spitefr/hermes-agent-kanban-enhancements"
+manifest_version: 2
+requires_hermes: ">=0.21"
+tags:
+  - kanban
+  - dispatcher
+  - desktop
+provides_hooks:
+  - post_llm_call
+config_schema:
+  stop_terminates_workers:
+    type: boolean
+    default: true
+    description: "Stopping the board also terminates running workers (tasks return to ready). False leaves them running and only blocks new spawns."
+  log_timestamps:
+    type: boolean
+    default: true
+    description: "Workers prefix every log line with its write time."
+  worker_context_snapshots:
+    type: boolean
+    default: true
+    description: "Workers write a context-window snapshot next to their log."
+  context_snapshot_interval_seconds:
+    type: integer
+    default: 15
+    description: "Minimum seconds between two worker context snapshots."
