@@ -6,12 +6,14 @@ patched core files, no desktop rebuild.
 
 | | |
 |---|---|
+| **Separate boards** | The board switcher core's Kanban page has, in the Kanban+ page header: switch between boards, create one (scoped to a Hermes project), rename it, export and import it, archive it. Every control here — the stop switch, the board model, the logs — then applies to the board you picked, and the pick survives a restart. |
+| **The board's columns** | The lanes themselves — *Triage, Todo, Geplant, Ready, Läuft, Blockiert, Review, Fertig* — with their cards; picking a card opens its worker log underneath. |
 | **Stop the whole board** | One switch that persists. Running workers are reclaimed (tasks go back to *ready*), and nothing dispatches again — not the gateway tick, not the CLI, not the desktop nudge — until you start the board. It survives gateway and app restarts, so a restart never silently resumes work. |
 | **A live cap on parallel runs** | `kanban.max_in_progress` is re-read on every tick, so changing it needs no restart, and `0` finally means *explicitly unbounded* instead of falling back to the memory-derived default. |
 | **A model for the whole board** | Pick one model and every task run *and* the auto-composer (decompose / specify) use it. A task that pins its own model keeps it. Unset = every profile uses its own model, exactly like the per-task override. |
 | **Timestamped worker logs** | Workers prefix every log line with the time they wrote it. Every existing reader keeps the classic format — the stamps are stripped unless a caller asks for them. |
 | **Worker context snapshots** | Each worker writes how full its context window is next to its log, so you can see it from outside the process. |
-| **A desktop page** | `Kanban+` in the sidebar: board state, the controls above, a session-sized worker log with a time gutter, and a context meter per worker. Plus a status-bar pill, three command-palette entries and a context-fill strip above the chat composer. |
+| **A desktop page** | `Kanban+` in the sidebar: the board's columns, board state, the controls above, a session-sized worker log with a time gutter, and a context meter per worker. Plus a status-bar pill, three command-palette entries and a context-fill strip above the chat composer. |
 
 The desktop UI is currently German-only. Everything else (CLI, API, logs) is English.
 
@@ -45,8 +47,15 @@ they find, from a local clone — useful for offline installs and for testing a 
 
 ### Desktop
 
-**Kanban+** in the sidebar. The status-bar pill shows the board state and opens stop/start;
-⌘K/Ctrl+K has *Kanban: Board stoppen / starten / Board-Seite öffnen*.
+**Kanban+** in the sidebar. The page header carries the **board switcher** — the same one core's
+Kanban page has: pick a board, or create, rename, scope, export, import and archive one. The pick is
+remembered per install and scopes everything else on the page (a board whose dispatch is stopped is
+marked in the list).
+
+Below it the board's **columns** with their cards; clicking a card (or a row in the running/recent
+list) opens that worker's log and context meter underneath. The status-bar pill shows the picked
+board's state and opens stop/start; ⌘K/Ctrl+K has *Kanban: Board stoppen / starten / Board-Seite
+öffnen*.
 
 ### CLI
 
@@ -69,8 +78,20 @@ All of them take `--board <slug>` for a board other than the current one.
 Mounted at `/api/plugins/kanban-enhancements`, behind the same dashboard auth as every other
 plugin API:
 
+All task endpoints take `?board=<slug>` and answer from **that** board's database; omitting it uses
+the active board.
+
 | Endpoint | What |
 |---|---|
+| `GET /boards` | Every board with its task counts, the active slug and this plugin's stop switch |
+| `POST /boards` `{slug, name, project_id?, switch?}` | Create a board (idempotent) |
+| `PATCH /boards/{slug}` `{name?, project_id?, default_workdir?}` | Display name, project scope, workdir (the slug is immutable) |
+| `DELETE /boards/{slug}` `?delete=` | Archive (default) or hard-delete; `default` is refused |
+| `POST /boards/{slug}/export` `{output?}` | Write the board to a `.tar.gz` on the backend's filesystem |
+| `POST /boards/import` `{archive, slug?, switch?}` | Import an archive as a new board |
+| `POST /boards/{slug}/switch` | Persist the board as active (CLI parity; the page picks client-side) |
+| `GET /projects` | Live Hermes projects, for scoping a board |
+| `GET /board` `?include_archived=` | The board grouped into its status columns — what the page draws |
 | `GET /state` | Board switch, running workers, cap, board model, and whether the core hooks are active |
 | `POST /stop` `{reason?}` | Stop the board, reclaim running workers |
 | `POST /start` | Start the board and dispatch once |
@@ -118,8 +139,8 @@ If you hit that, please open an issue with your Hermes version.
 ```bash
 git clone https://github.com/Iluvatar82/hermes-agent-kanban-enhancements
 cd hermes-agent-kanban-enhancements
-HERMES_AGENT_REPO=/path/to/hermes-agent pytest    # 38 tests against a real checkout
-node --test tests/desktop/                        # the desktop helpers, with stubbed SDK
+HERMES_AGENT_REPO=/path/to/hermes-agent pytest    # 47 tests against a real checkout
+node --test tests/desktop/*.test.mjs              # the desktop helpers, with stubbed SDK
 ruff check .
 ```
 
@@ -137,8 +158,9 @@ kanban-enhancements/      the installable package (this is what lands in $HERMES
   log_stamps.py           per-line log timestamps + the reader patch
   worker_context.py       the context snapshot
   cli_commands.py         hermes kanban-plus …
-  dashboard/plugin_api.py the REST namespace
-  desktop/plugin.js       the desktop plugin (plain ESM, no build step)
+  dashboard/plugin_api.py the REST namespace (board controls + the board directory)
+  desktop/plugin.js       the desktop plugin (plain ESM, no build step): page, board
+                          switcher, columns, worker log, status bar, palette
 scripts/                  install helpers
 tests/                    pytest + node --test
 ```

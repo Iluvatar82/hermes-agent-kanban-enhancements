@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
@@ -46,13 +46,32 @@ export const PALETTE_AREA = 'palette'
 export const ROUTES_AREA = 'routes'
 export const SIDEBAR_NAV_AREA = 'sidebar.nav'
 export const STATUSBAR_AREAS = { left: 'statusBar.left', right: 'statusBar.right' }
-for (const name of ['Badge','Button','Codicon','ConfirmDialog','DropdownMenu','DropdownMenuContent',
+export const WORKSPACE_PAGE_HEADER_AREA = 'workspace.pageHeader'
+export const isSubmitEnter = () => false
+// A nanostore the size of what the plugin uses: get / set / listen.
+export const atom = initial => {
+  let value = initial
+  const listeners = new Set()
+
+  return {
+    get: () => value,
+    set(next) { value = next; for (const fn of listeners) fn(next) },
+    listen(fn) { listeners.add(fn); return () => listeners.delete(fn) },
+    subscribe(fn) { fn(value); listeners.add(fn); return () => listeners.delete(fn) }
+  }
+}
+for (const name of ['Badge','Button','Codicon','ConfirmDialog','Contribute','Dialog','DialogContent',
+  'DialogFooter','DialogHeader','DialogTitle','DropdownMenu','DropdownMenuContent',
   'DropdownMenuItem','DropdownMenuSeparator','DropdownMenuTrigger','EmptyState','ErrorState','Input',
-  'Loader','Popover','PopoverContent','PopoverTrigger','ScrollArea','SearchField','StatusDot','Tip']) {
+  'Loader','Popover','PopoverContent','PopoverTrigger','ScrollArea','SearchField','Select','SelectContent',
+  'SelectItem','SelectTrigger','SelectValue','StatusDot','Tip']) {
   Object.defineProperty(globalThis, name, { value: stub(name), configurable: true })
 }
 export const Badge = globalThis.Badge, Button = globalThis.Button, Codicon = globalThis.Codicon
-export const ConfirmDialog = globalThis.ConfirmDialog, DropdownMenu = globalThis.DropdownMenu
+export const ConfirmDialog = globalThis.ConfirmDialog, Contribute = globalThis.Contribute
+export const Dialog = globalThis.Dialog, DialogContent = globalThis.DialogContent
+export const DialogFooter = globalThis.DialogFooter, DialogHeader = globalThis.DialogHeader
+export const DialogTitle = globalThis.DialogTitle, DropdownMenu = globalThis.DropdownMenu
 export const DropdownMenuContent = globalThis.DropdownMenuContent, DropdownMenuItem = globalThis.DropdownMenuItem
 export const DropdownMenuSeparator = globalThis.DropdownMenuSeparator
 export const DropdownMenuTrigger = globalThis.DropdownMenuTrigger, EmptyState = globalThis.EmptyState
@@ -60,6 +79,9 @@ export const ErrorState = globalThis.ErrorState, Input = globalThis.Input, Loade
 export const Popover = globalThis.Popover, PopoverContent = globalThis.PopoverContent
 export const PopoverTrigger = globalThis.PopoverTrigger, ScrollArea = globalThis.ScrollArea
 export const SearchField = globalThis.SearchField, StatusDot = globalThis.StatusDot, Tip = globalThis.Tip
+export const Select = globalThis.Select, SelectContent = globalThis.SelectContent
+export const SelectItem = globalThis.SelectItem, SelectTrigger = globalThis.SelectTrigger
+export const SelectValue = globalThis.SelectValue
 `
   )
   // react + react/jsx-runtime: the helpers under test never render, so the
@@ -197,5 +219,90 @@ describe('modelLabel', () => {
     assert.equal(plugin.modelLabel({ model: 'qwen', provider: '' }, 'inherit'), 'qwen')
     assert.equal(plugin.modelLabel({ model: '   ', provider: 'x' }, 'inherit'), 'inherit')
     assert.equal(plugin.modelLabel(undefined, 'inherit'), 'inherit')
+  })
+})
+
+describe('the picked board', () => {
+  it('leaves a path alone while the server-side current board is picked', () => {
+    plugin.$boardSlug.set('')
+
+    assert.equal(plugin.withBoard('/state'), '/state')
+    assert.equal(plugin.withBoard('/tasks/t_1/log', { tail: '100' }), '/tasks/t_1/log?tail=100')
+  })
+
+  it('carries the picked board on every call', () => {
+    plugin.$boardSlug.set('shipping')
+
+    assert.equal(plugin.withBoard('/state'), '/state?board=shipping')
+    assert.equal(plugin.withBoard('/tasks/t_1/log', { tail: '100' }), '/tasks/t_1/log?tail=100&board=shipping')
+
+    plugin.$boardSlug.set('')
+  })
+
+  it('remembers a selected task per board', () => {
+    assert.equal(plugin.selectedTaskKey(''), 'hermes.plugin.kanban-enhancements.selectedTask')
+    assert.equal(plugin.selectedTaskKey('shipping'), 'hermes.plugin.kanban-enhancements.selectedTask.shipping')
+  })
+
+  it('hydrates from plugin storage and writes every change back', () => {
+    const stored = { boardSlug: 'shipping' }
+    const disposers = []
+    const ctx = {
+      onDispose: fn => disposers.push(fn),
+      register() {},
+      registerMany() {},
+      rest: async () => ({}),
+      storage: { get: (key, fallback) => stored[key] ?? fallback, set: (key, value) => { stored[key] = value } }
+    }
+
+    plugin.default.register(ctx)
+    assert.equal(plugin.$boardSlug.get(), 'shipping')
+
+    plugin.$boardSlug.set('ops')
+    assert.equal(stored.boardSlug, 'ops')
+
+    disposers.forEach(dispose => dispose())
+    plugin.$boardSlug.set('')
+  })
+})
+
+describe('board names', () => {
+  it('derives the slug `boards create` would make', () => {
+    assert.equal(plugin.boardSlugFromName('  Ship it! 2.0 '), 'ship-it-2-0')
+    assert.equal(plugin.boardSlugFromName('***'), '')
+    assert.equal(plugin.boardSlugFromName(undefined), '')
+  })
+
+  it('labels the switcher with the display name, the slug, or the word', () => {
+    const boards = {
+      boards: [{ name: 'Default', slug: 'default' }, { name: '', slug: 'shipping' }],
+      current: 'default'
+    }
+
+    assert.equal(plugin.boardLabel(boards, ''), 'Default')
+    assert.equal(plugin.boardLabel(boards, 'shipping'), 'shipping')
+    assert.equal(plugin.boardLabel(boards, 'archived-one'), 'Board')
+    assert.equal(plugin.boardLabel(undefined, ''), 'Board')
+  })
+})
+
+describe('columnMeta', () => {
+  it('keeps core’s lanes, and falls back to the raw status', () => {
+    assert.equal(plugin.columnMeta('running').codicon, 'sync')
+    assert.equal(plugin.columnMeta('running').label, 'Läuft')
+    assert.equal(plugin.columnMeta('triage').codicon, 'inbox')
+    assert.equal(plugin.columnMeta('a-status-a-later-hermes-adds').label, 'a-status-a-later-hermes-adds')
+  })
+})
+
+describe('element construction', () => {
+  // `jsx(Component)` without a props object throws "Cannot read properties of
+  // undefined (reading 'key')" inside React's real runtime and takes the whole
+  // page down — the stub above is too forgiving to catch it, so read the source.
+  it('never calls jsx() without a props object', () => {
+    const source = readFileSync(pluginFile, 'utf8')
+    const offenders = [...source.matchAll(/\bjsxs?\(\s*[A-Za-z_$][\w$.]*\s*\)/g)].map(match => match[0])
+
+    assert.deepEqual(offenders, [])
   })
 })
