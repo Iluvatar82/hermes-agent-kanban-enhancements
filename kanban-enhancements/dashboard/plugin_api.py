@@ -141,7 +141,7 @@ def _state_payload(board: str | None) -> dict[str, Any]:
         "max_in_progress_set": explicit,
         "effective_max_in_progress": pkg.dispatch_guard.effective_cap(),
         "guard_active": pkg.dispatch_guard.is_installed(),
-        "plugin_version": "0.2.1",
+        "plugin_version": "0.3.0",
     }
 
 
@@ -293,6 +293,168 @@ def get_board(board: str | None = _BOARD_Q, include_archived: bool = Query(False
         "columns": [{"name": name, "tasks": columns[name]} for name in names],
         "now": int(time.time()),
     }
+
+
+# --- One task: the detail view, its status, its comments --------------------
+# The desktop page's task view mirrors core's own task drawer, so it needs the
+# same payload. Reading it is pure ``kanban_db``; WRITING a status is not — the
+# transition rules (reclaim a running worker, re-gate ``ready`` on its parents,
+# close the open run, refuse a locked lane) live in core's kanban plugin API and
+# are far too much machinery to re-implement here from private helpers. So a
+# status change is DELEGATED to that module, and when a Hermes update moves it
+# the page says so instead of writing a half-correct row.
+
+#: Columns the detail view has no business showing: two are the worker's claim
+#: credentials, the third is a dedupe key for the writer, not the reader.
+_TASK_PRIVATE_FIELDS = ("claim_lock", "claim_expires", "idempotency_key")
+
+#: A years-old task can carry thousands of events; the view shows a feed, not an
+#: archive, so only the newest slice travels (still oldest-first, like core's).
+_MAX_EVENTS = 200
+
+#: Where the dashboard parks core's kanban plugin API once it mounts it
+#: (``_mount_plugin_api_routes`` in ``hermes_cli/web_server_dashboard.py``).
+_CORE_API_MODULE = "hermes_dashboard_plugin_kanban"
+_CORE_API_SYNTHETIC = "hermes_kanban_core_api_for_plus"
+
+
+def _core_kanban_api():
+    """Core's kanban plugin API module, or ``None`` when it cannot be reached.
+
+    Normally it is already in ``sys.modules``: both namespaces are mounted into
+    the same FastAPI app by the same loader. The by-path load is the fallback
+    for a process that imported ours but not core's.
+    """
+    module = sys.modules.get(_CORE_API_MODULE) or sys.modules.get(_CORE_API_SYNTHETIC)
+    if module is not None and hasattr(module, "update_task"):
+        return module
+    try:
+        from hermes_cli.plugins import get_bundled_plugins_dir
+
+        api_path = get_bundled_plugins_dir() / "kanban" / "dashboard" / "plugin_api.py"
+        if not api_path.is_file():
+            return None
+        spec = importlib.util.spec_from_file_location(_CORE_API_SYNTHETIC, api_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        # Registered before exec so pydantic can resolve the module's own
+        # postponed annotations by name — the same order the loader uses.
+        sys.modules[_CORE_API_SYNTHETIC] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(_CORE_API_SYNTHETIC, None)
+            raise
+    except Exception:
+        _package().core.logger.warning("core kanban API unavailable", exc_info=True)
+        return None
+    return module if hasattr(module, "update_task") else None
+
+
+def _core_kanban_api_or_503():
+    core = _core_kanban_api()
+    if core is None or not hasattr(core, "UpdateTaskBody"):
+        raise HTTPException(
+            status_code=503,
+            detail="the core kanban plugin API is not available in this process, "
+                   "so Kanban+ cannot move a task; enable the bundled 'kanban' plugin")
+    return core
+
+
+class TaskPatchBody(BaseModel):
+    """What the task view may change. Mirrors the subset of core's
+    ``UpdateTaskBody`` this plugin's page actually offers; unsent fields are
+    left alone (``exclude_unset`` below), and ``clear_model_override`` is the
+    explicit "back to the profile's model" signal a ``None`` cannot carry."""
+
+    status: str | None = Field(None, max_length=50)
+    title: str | None = Field(None, max_length=500)
+    body: str | None = Field(None, max_length=100_000)
+    assignee: str | None = Field(None, max_length=200)
+    priority: int | None = Field(None, ge=-1_000_000, le=1_000_000)
+    model_override: str | None = Field(None, max_length=200)
+    provider_override: str | None = Field(None, max_length=100)
+    clear_model_override: bool = False
+
+
+class TaskCommentBody(BaseModel):
+    body: str = Field(..., min_length=1, max_length=20_000)
+    author: str = Field("desktop", max_length=100)
+
+
+def _task_detail_dict(task) -> dict[str, Any]:
+    """Every ``Task`` field the view can render, minus the private ones."""
+    from dataclasses import asdict
+
+    detail = asdict(task)
+    for field in _TASK_PRIVATE_FIELDS:
+        detail.pop(field, None)
+    return detail
+
+
+def _require_task(conn, task_id: str):
+    from hermes_cli import kanban_db as kb
+
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"task {task_id} does not exist")
+    return task
+
+
+@router.get("/tasks/{task_id}")
+def get_task_detail(task_id: str, board: str | None = _BOARD_Q):
+    """One task with everything the detail view shows: the row itself, its
+    comments, its activity feed, its run history and its dependency links."""
+    from dataclasses import asdict
+
+    from hermes_cli import kanban_db as kb
+
+    slug = _resolve_board(board)
+    with _kanban_conn(slug) as conn:
+        task = _require_task(conn, task_id)
+        detail = _task_detail_dict(task)
+        # Workers hand off through ``task_runs.summary`` and leave ``result``
+        # NULL, so a done task looks empty without this.
+        detail["latest_summary"] = kb.latest_summary(conn, task_id)
+        comments = [asdict(c) for c in kb.list_comments(conn, task_id)]
+        events = [asdict(e) for e in kb.list_events(conn, task_id)][-_MAX_EVENTS:]
+        runs = [asdict(r) for r in kb.list_runs(conn, task_id)]
+        links = {"parents": kb.parent_ids(conn, task_id), "children": kb.child_ids(conn, task_id)}
+    return {"task": detail, "comments": comments, "events": events, "runs": runs, "links": links}
+
+
+@router.patch("/tasks/{task_id}")
+def patch_task(task_id: str, payload: TaskPatchBody, board: str | None = _BOARD_Q):
+    """Move a task to another column (drag & drop, the card menu, the status
+    menu) or edit one of its fields — delegated to core's kanban API so the
+    transition rules are the ones the rest of Hermes enforces."""
+    core = _core_kanban_api_or_503()
+    slug = _resolve_board(board)
+    fields = payload.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="nothing to change")
+    unknown = sorted(set(fields) - set(core.UpdateTaskBody.model_fields))
+    if unknown:
+        raise HTTPException(
+            status_code=501,
+            detail=f"this Hermes' kanban API does not accept: {', '.join(unknown)}")
+    with _errors_to_500("could not update the task"):
+        return core.update_task(task_id, core.UpdateTaskBody(**fields), board=slug)
+
+
+@router.post("/tasks/{task_id}/comments")
+def add_task_comment(task_id: str, payload: TaskCommentBody, board: str | None = _BOARD_Q):
+    """Add a comment. A running worker reads new comments from its context, so
+    this is also how an operator nudges one mid-run."""
+    from hermes_cli import kanban_db as kb
+
+    slug = _resolve_board(board)
+    with _kanban_conn(slug) as conn:
+        _require_task(conn, task_id)
+        with _value_error_400():
+            comment_id = kb.add_comment(conn, task_id, payload.author, payload.body)
+    return {"id": comment_id, "task_id": task_id}
 
 
 @router.get("/tasks/{task_id}/log")

@@ -295,6 +295,112 @@ describe('columnMeta', () => {
   })
 })
 
+describe('errText', () => {
+  it('surfaces the detail the REST bridge buried in a status line', () => {
+    assert.equal(
+      plugin.errText(new Error('409: {"detail":"Cannot move to \'ready\': blocked by parent(s)"}')),
+      "Cannot move to 'ready': blocked by parent(s)"
+    )
+  })
+
+  it('keeps a plain message, and never returns an empty string', () => {
+    assert.equal(plugin.errText(new Error('boom')), 'boom')
+    assert.equal(plugin.errText('boom'), 'boom')
+    assert.equal(plugin.errText(new Error('500: not json {')), '500: not json {')
+    assert.equal(plugin.errText(undefined), 'Unbekannter Fehler')
+  })
+})
+
+describe('shortId', () => {
+  it('drops the prefix and keeps six characters', () => {
+    assert.equal(plugin.shortId('t_ab12cd34ef'), 'ab12cd')
+    assert.equal(plugin.shortId('short'), 'short')
+    assert.equal(plugin.shortId(null), '')
+  })
+})
+
+describe('logTail', () => {
+  const log = ['one', 'two', 'three', 'four'].join('\n')
+
+  it('keeps the LAST lines, because that is where the worker is now', () => {
+    assert.equal(plugin.logTail(log, 2), 'three\nfour')
+  })
+
+  it('treats a trailing newline as a terminator, not a line', () => {
+    assert.equal(plugin.logTail(`${log}\n`, 2), 'three\nfour\n')
+  })
+
+  it('leaves a short log and an absent limit alone', () => {
+    assert.equal(plugin.logTail(log, 10), log)
+    assert.equal(plugin.logTail(log, 0), log)
+    assert.equal(plugin.logTail(null, 5), '')
+  })
+})
+
+describe('drop targets', () => {
+  it('refuses the lanes the dispatcher owns', () => {
+    assert.equal(plugin.isLockedTarget('running'), true)
+    assert.equal(plugin.isLockedTarget('review'), true)
+    assert.equal(plugin.isLockedTarget('scheduled'), true)
+    assert.equal(plugin.isLockedTarget('todo'), false)
+  })
+
+  it('offers every open lane but the card’s own', () => {
+    const columns = ['triage', 'todo', 'scheduled', 'ready', 'running', 'blocked', 'review', 'done']
+
+    assert.deepEqual(plugin.moveTargets(columns, 'todo'), ['triage', 'ready', 'blocked', 'done'])
+    assert.deepEqual(plugin.moveTargets(columns, 'running'), ['triage', 'todo', 'ready', 'blocked', 'done'])
+    assert.deepEqual(plugin.moveTargets(undefined, 'todo'), [])
+  })
+})
+
+describe('clampMenu', () => {
+  const viewport = { viewportHeight: 800, viewportWidth: 1000 }
+
+  it('opens where the pointer is when there is room', () => {
+    assert.deepEqual(plugin.clampMenu({ ...viewport, height: 100, width: 200, x: 300, y: 400 }), {
+      left: 300,
+      top: 400
+    })
+  })
+
+  it('pulls a menu back inside when it would overflow an edge', () => {
+    assert.deepEqual(plugin.clampMenu({ ...viewport, height: 100, width: 200, x: 990, y: 790 }), {
+      left: 794,
+      top: 694
+    })
+  })
+
+  it('never leaves the viewport on the other side either', () => {
+    const { left, top } = plugin.clampMenu({ height: 900, viewportHeight: 200, viewportWidth: 100, width: 300, x: 0, y: 0 })
+
+    assert.ok(left >= 0 && top >= 0)
+  })
+})
+
+describe('eventLabel', () => {
+  it('reads a machine payload back as a sentence', () => {
+    assert.deepEqual(plugin.eventLabel({ kind: 'status', payload: { status: 'ready' } }), {
+      detail: undefined,
+      label: 'Verschoben nach Ready'
+    })
+    assert.equal(plugin.eventLabel({ kind: 'assigned', payload: { assignee: 'dev' } }).label, 'Zugewiesen an dev')
+    assert.equal(plugin.eventLabel({ kind: 'assigned', payload: {} }).label, 'Zuweisung entfernt')
+    assert.equal(plugin.eventLabel({ kind: 'spawned', payload: { pid: 42 } }).detail, 'PID 42')
+  })
+
+  it('parses a payload the backend stored as JSON text', () => {
+    assert.equal(plugin.eventLabel({ kind: 'blocked', payload: '{"reason":"kein Netz"}' }).detail, 'kein Netz')
+  })
+
+  it('still says something for a kind it has never seen', () => {
+    assert.deepEqual(plugin.eventLabel({ kind: 'some_new_kind', payload: { a: 1, b: null } }), {
+      detail: 'a=1',
+      label: 'some new kind'
+    })
+  })
+})
+
 describe('element construction', () => {
   // `jsx(Component)` without a props object throws "Cannot read properties of
   // undefined (reading 'key')" inside React's real runtime and takes the whole
@@ -304,5 +410,31 @@ describe('element construction', () => {
     const offenders = [...source.matchAll(/\bjsxs?\(\s*[A-Za-z_$][\w$.]*\s*\)/g)].map(match => match[0])
 
     assert.deepEqual(offenders, [])
+  })
+
+  // `jsx(Typo, …)` is a ReferenceError the moment that branch renders, which
+  // can be a task view nobody opened during a smoke test. The stub SDK is far
+  // too forgiving to catch it, so the names are checked against the source.
+  it('only builds elements from components this file actually has', () => {
+    const source = readFileSync(pluginFile, 'utf8')
+    const names = pattern => new Set([...source.matchAll(pattern)].map(match => match[1]))
+
+    const declared = new Set([
+      // `function X(` / `export function X(`
+      ...names(/^(?:export )?function ([A-Za-z_$][\w$]*)/gm),
+      // `const X = …` at module scope (memo() components, atoms, constants)
+      ...names(/^(?:export )?const ([A-Za-z_$][\w$]*) =/gm),
+      // Everything imported — the SDK block, react, react/jsx-runtime.
+      ...[...source.matchAll(/import\s*\{([^}]*)\}\s*from/g)].flatMap(match =>
+        match[1].split(',').map(part => part.trim().split(/\s+as\s+/).pop())
+      )
+    ])
+
+    const used = [...names(/\bjsxs?\(\s*([A-Z][\w$]*)/g)]
+    const missing = used.filter(name => !declared.has(name))
+
+    assert.deepEqual(missing, [])
+    // A guard that finds nothing because its patterns broke is worse than none.
+    assert.ok(used.length > 20 && declared.has('Codicon') && declared.has('TaskDetailPanel'))
   })
 })
