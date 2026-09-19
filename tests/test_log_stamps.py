@@ -67,6 +67,24 @@ def test_only_a_real_file_is_stamped(pkg, tmp_path):
     assert is_file(None) is False
 
 
+def test_a_worker_log_never_doubles_a_carriage_return(pkg, tmp_path):
+    """A text stream on Windows rewrites every ``\n`` as ``\r\n``, so a line the
+    worker echoed from a child process (already CRLF) reached the file as
+    ``\r\r\n`` — which the desktop log read as an empty line, every line.
+    ``newline="\r\n"`` reproduces that translation on any platform."""
+    log = tmp_path / "t_4.log"
+    with open(log, "w", encoding="utf-8", newline="\r\n") as handle:
+        stream = pkg.log_stamps._wrap(handle)
+        assert isinstance(stream, pkg.log_stamps.TimestampedStream)
+        stream.write("echoed from a child\r\n")
+        stream.write("written right here\n")
+    # Read the bytes, not the text: `read_text` would undo the very translation
+    # this test is about.
+    raw = log.read_bytes().decode("utf-8")
+    # The child's own CRLF survives — that is data. Nothing is added to it.
+    assert pkg.log_stamps.strip_timestamps(raw) == "echoed from a child\r\nwritten right here\n"
+
+
 def test_worker_streams_are_stamped_in_a_real_process(pkg, tmp_path):
     """End to end: a child with HERMES_KANBAN_TASK set and stdout on a file."""
     script = (

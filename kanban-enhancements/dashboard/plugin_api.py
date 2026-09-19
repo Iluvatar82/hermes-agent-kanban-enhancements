@@ -44,7 +44,7 @@ def _same_file(left: str, right: str) -> bool:
 #: not a read of plugin.yaml, because an update swaps that file while this
 #: module stays loaded and the difference is what "restart required" means.
 #: tests/test_manifest.py keeps it equal to the manifest.
-_PLUGIN_VERSION = "0.4.0"
+_PLUGIN_VERSION = "0.5.0"
 
 
 def _package():
@@ -371,6 +371,18 @@ def list_tasks(board: str | None = _BOARD_Q, limit: int = Query(40, ge=1, le=200
     return {"running": running, "recent": [row for row in recent if row["id"] not in seen]}
 
 
+@router.get("/assignees")
+def list_assignees(board: str | None = _BOARD_Q):
+    """Profiles on disk plus everyone this board already assigns to — the same
+    union core's picker offers, so a fresh profile is pickable before it has a
+    task."""
+    from hermes_cli import kanban_db as kb
+
+    slug = _resolve_board(board)
+    with _kanban_conn(slug) as conn:
+        return {"assignees": kb.known_assignees(conn)}
+
+
 @router.get("/board")
 def get_board(board: str | None = _BOARD_Q, include_archived: bool = Query(False)):
     """The board's own columns for the picked board — the lanes the page draws.
@@ -495,6 +507,32 @@ class TaskPatchBody(BaseModel):
     clear_model_override: bool = False
 
 
+# The lanes the dispatcher hands out. Core refuses a bare status move into
+# any of them with a 409, so an add that targets one is refused HERE instead
+# of creating the task and then failing to move it.
+_DISPATCHER_LANES = frozenset({"review", "running", "scheduled"})
+
+
+class TaskCreateBody(BaseModel):
+    """What the board's per-lane ``+`` offers. Every field but ``status`` is a
+    field of core's own ``CreateTaskBody`` and is handed to it untouched;
+    ``status`` is the lane the button sat in, which core's create does not take
+    — it derives ``triage``/``todo``/``ready`` itself, and the rest is a move."""
+
+    title: str = Field(..., min_length=1, max_length=500)
+    body: str | None = Field(None, max_length=100_000)
+    assignee: str | None = Field(None, max_length=200)
+    priority: int = Field(0, ge=-1_000_000, le=1_000_000)
+    status: str | None = Field(None, max_length=50)
+    workspace_kind: str | None = Field(None, max_length=50)
+    workspace_path: str | None = Field(None, max_length=4_096)
+    parents: list[str] = Field(default_factory=list, max_length=50)
+    skills: list[str] | None = Field(None, max_length=50)
+    goal_mode: bool = False
+    model_override: str | None = Field(None, max_length=200)
+    provider_override: str | None = Field(None, max_length=100)
+
+
 class TaskCommentBody(BaseModel):
     body: str = Field(..., min_length=1, max_length=20_000)
     author: str = Field("desktop", max_length=100)
@@ -539,6 +577,56 @@ def get_task_detail(task_id: str, board: str | None = _BOARD_Q):
         runs = [asdict(r) for r in kb.list_runs(conn, task_id)]
         links = {"parents": kb.parent_ids(conn, task_id), "children": kb.child_ids(conn, task_id)}
     return {"task": detail, "comments": comments, "events": events, "runs": runs, "links": links}
+
+
+@router.post("/tasks")
+def create_task(payload: TaskCreateBody, board: str | None = _BOARD_Q):
+    """Create a task in a lane — the board's per-lane ``+``.
+
+    Delegated to core's kanban API so the defaults, the validation and the
+    dispatcher-presence warning are the ones every other surface gets. Core
+    derives the new task's status (``triage`` when the lane is Triage, else
+    ``ready``, or ``todo`` behind an unfinished parent), so landing it in the
+    lane that was clicked is a second call — the same two steps core's own
+    board page takes.
+    """
+    core = _core_kanban_api_or_503()
+    if not hasattr(core, "CreateTaskBody"):
+        raise HTTPException(
+            status_code=501, detail="this Hermes' kanban API cannot create tasks")
+
+    slug = _resolve_board(board)
+    fields = payload.model_dump(exclude_unset=True)
+    target = (fields.pop("status", None) or "").strip() or None
+    if target in _DISPATCHER_LANES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{target} is the dispatcher's to hand out; create the task in ready instead")
+    # Triage is not a move: core's create reaches it through this flag alone.
+    if target == "triage":
+        fields["triage"] = True
+    unknown = sorted(set(fields) - set(core.CreateTaskBody.model_fields))
+    if unknown:
+        raise HTTPException(
+            status_code=501,
+            detail=f"this Hermes' kanban API does not accept: {', '.join(unknown)}")
+
+    with _errors_to_500("could not create the task"):
+        result = core.create_task(core.CreateTaskBody(**fields), board=slug)
+    task = (result or {}).get("task")
+    # A lane core did not derive on its own is a move, and it goes through the
+    # same seam a drag does — transition rules included. A refused move leaves
+    # the task where it landed rather than losing it: the response says where,
+    # and the page surfaces the warning the way it surfaces core's own.
+    if task and target and task.get("status") != target:
+        try:
+            with _errors_to_500("could not move the new task"):
+                core.update_task(task["id"], core.UpdateTaskBody(status=target), board=slug)
+            task["status"] = target
+        except HTTPException as exc:
+            result["warning"] = (
+                f"created in {task.get('status')}, but the move to {target} was refused: {exc.detail}")
+    return result
 
 
 @router.patch("/tasks/{task_id}")

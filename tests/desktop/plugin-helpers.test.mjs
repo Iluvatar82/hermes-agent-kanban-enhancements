@@ -191,9 +191,57 @@ describe('buildLogRows', () => {
     assert.equal(lines('[2026-09-17T08:00:00Z] 10%\r50%\r100%')[0].text, '100%')
   })
 
+  it('keeps the line a Windows log ends with \\r\\r\\n', () => {
+    // The bug this test exists for: a worker's text stream rewrites its `\n`
+    // as `\r\n`, so a line that was ALREADY CRLF reaches the file doubled.
+    // Read as "everything after the last \r", every row came out blank — a
+    // 26 KiB log rendered as an empty box.
+    const rows = lines('[2026-09-17T08:00:00Z] built in 3.4s\r\r\n[2026-09-17T08:00:01Z] done\r\r\n')
+
+    assert.deepEqual(rows.map(row => row.text), ['built in 3.4s', 'done'])
+  })
+
+  it('keeps a line whose only carriage return is the one at its end', () => {
+    assert.deepEqual(lines('plain\r\nlines\r\n').map(row => row.text), ['plain', 'lines'])
+    assert.equal(lines('cursor parked\r')[0].text, 'cursor parked')
+  })
+
   it('survives empty and missing input', () => {
     assert.deepEqual(plugin.buildLogRows(''), [])
     assert.deepEqual(plugin.buildLogRows(null), [])
+  })
+})
+
+describe('collapseCarriageReturns', () => {
+  const collapse = plugin.collapseCarriageReturns
+
+  it('keeps the last frame that actually wrote something', () => {
+    assert.equal(collapse('10%\r50%\r100%'), '100%')
+    assert.equal(collapse('done\r\r'), 'done')
+    assert.equal(collapse('no returns here'), 'no returns here')
+    assert.equal(collapse('\r\r'), '')
+  })
+})
+
+describe('plainLogText', () => {
+  it('drops the stamps, the ANSI and the carriage returns, keeps the lines', () => {
+    const log = [
+      '[2026-09-17T08:00:00Z] \u001b[32mstarting\u001b[0m\r',
+      '[2026-09-17T08:00:01Z] 10%\r100%\r',
+      'no stamp at all\r',
+      ''
+    ].join('\n')
+
+    assert.equal(plugin.plainLogText(log), 'starting\n100%\nno stamp at all\n')
+  })
+
+  it('leaves a bracket that is not a stamp alone', () => {
+    assert.equal(plugin.plainLogText('[exit 128] see above'), '[exit 128] see above')
+  })
+
+  it('survives empty and missing input', () => {
+    assert.equal(plugin.plainLogText(''), '')
+    assert.equal(plugin.plainLogText(null), '')
   })
 })
 
@@ -397,6 +445,94 @@ describe('shortId', () => {
     assert.equal(plugin.shortId('t_ab12cd34ef'), 'ab12cd')
     assert.equal(plugin.shortId('short'), 'short')
     assert.equal(plugin.shortId(null), '')
+  })
+})
+
+describe('parseSkills', () => {
+  it('splits on commas and drops the empties', () => {
+    assert.deepEqual(plugin.parseSkills(' python , , review '), ['python', 'review'])
+    assert.deepEqual(plugin.parseSkills(''), [])
+    assert.deepEqual(plugin.parseSkills(null), [])
+  })
+})
+
+describe('newTaskPayload', () => {
+  const form = {
+    assignee: '__inherit__',
+    body: '',
+    goalMode: false,
+    model: { model: '', provider: '' },
+    parent: '',
+    priority: '0',
+    skills: '',
+    title: '  Ship it  ',
+    workspaceKind: '__inherit__',
+    workspacePath: ''
+  }
+
+  it('sends the lane, the trimmed title and nothing it was not given', () => {
+    // An empty field sent as '' is not the same as an omitted one: core reads
+    // the first as "no, really, nothing" where it would otherwise inherit the
+    // board's default.
+    assert.deepEqual(plugin.newTaskPayload(form, 'todo'), { priority: 0, status: 'todo', title: 'Ship it' })
+  })
+
+  it('carries every field the dialog did get', () => {
+    assert.deepEqual(
+      plugin.newTaskPayload(
+        {
+          ...form,
+          assignee: 'dev_developer',
+          body: '  context  ',
+          goalMode: true,
+          model: { model: 'qwen3', provider: 'lmstudio' },
+          parent: 't_parent',
+          priority: '7',
+          skills: 'python, review',
+          workspaceKind: 'worktree',
+          workspacePath: ' /repo '
+        },
+        'ready'
+      ),
+      {
+        assignee: 'dev_developer',
+        body: 'context',
+        goal_mode: true,
+        model_override: 'qwen3',
+        parents: ['t_parent'],
+        priority: 7,
+        provider_override: 'lmstudio',
+        skills: ['python', 'review'],
+        status: 'ready',
+        title: 'Ship it',
+        workspace_kind: 'worktree',
+        workspace_path: '/repo'
+      }
+    )
+  })
+
+  it('leaves the assignee out entirely when none was picked', () => {
+    // Omitted, not empty: the dispatcher fills an unassigned ready task from
+    // `kanban.default_assignee` on its next tick, and an empty string would
+    // read as an answer where none was given.
+    assert.ok(!('assignee' in plugin.newTaskPayload(form, 'ready')))
+  })
+
+  it('drops a workspace path that scratch would ignore', () => {
+    const payload = plugin.newTaskPayload({ ...form, workspaceKind: 'scratch', workspacePath: '/repo' }, 'ready')
+
+    assert.equal(payload.workspace_kind, 'scratch')
+    assert.ok(!('workspace_path' in payload))
+  })
+
+  it('never sends a provider without the model it belongs to', () => {
+    const payload = plugin.newTaskPayload({ ...form, model: { model: '', provider: 'lmstudio' } }, 'ready')
+
+    assert.ok(!('provider_override' in payload) && !('model_override' in payload))
+  })
+
+  it('survives a priority that is not a number', () => {
+    assert.equal(plugin.newTaskPayload({ ...form, priority: 'abc' }, 'ready').priority, 0)
   })
 })
 

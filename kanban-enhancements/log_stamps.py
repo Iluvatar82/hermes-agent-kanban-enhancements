@@ -97,6 +97,12 @@ def _is_redirected_to_file(stream) -> bool:
 def _wrap(stream):
     if isinstance(stream, TimestampedStream) or not _is_redirected_to_file(stream):
         return stream
+    # LF only, whatever the platform thinks a line ends with. A text stream on
+    # Windows rewrites every ``\n`` as ``\r\n``, so a line the worker echoed
+    # from a child process (already CRLF) landed in the file as ``\r\r\n`` —
+    # a carriage return every reader then had to guess its way around.
+    with contextlib.suppress(AttributeError, OSError, TypeError, ValueError):
+        stream.reconfigure(newline="\n")
     # One line per write keeps the file in write order and the UI live.
     with contextlib.suppress(AttributeError, OSError, ValueError):
         stream.reconfigure(line_buffering=True)

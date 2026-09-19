@@ -7,10 +7,10 @@
  * jsx()/jsxs()/Fragment, exactly what a compiler would have emitted.
  *
  * What it adds on top of core Kanban:
- *   · a `/kanban-plus` page — the board switcher, the lanes with drag & drop
- *     and a card menu, board stop/start, a parallel-run cap, a board-wide
- *     model, and a task view (core's drawer, plus a worker context meter and a
- *     worker log that can take over the page)
+ *   · a `/kanban-plus` page — the board switcher, the lanes with drag & drop,
+ *     a card menu and a per-lane add, board stop/start, a parallel-run cap, a
+ *     board-wide model, and a task view (core's drawer, plus a worker context
+ *     meter and a worker log that can take over the page)
  *   · a statusbar pill with a small stop/start menu
  *   · three command-palette rows
  *   · a 3px context-fill strip above the composer
@@ -222,8 +222,9 @@ const stateKey = slug => ['kanban-plus', 'state', slug]
 const tasksKey = slug => ['kanban-plus', 'tasks', slug]
 const boardKey = slug => ['kanban-plus', 'board', slug]
 const TASK_KEY = ['kanban-plus', 'task']
-const logKey = (slug, id) => ['kanban-plus', 'log', slug, id]
+const logKey = (slug, id, view) => ['kanban-plus', 'log', slug, id, view]
 const contextKey = (slug, id) => ['kanban-plus', 'context', slug, id]
+const assigneesKey = slug => ['kanban-plus', 'assignees', slug]
 const taskKey = (slug, id) => ['kanban-plus', 'task', slug, id]
 
 const fetchState = () => api(withBoard('/state'))
@@ -233,14 +234,27 @@ const stopBoard = reason => api(withBoard('/stop'), { method: 'POST', body: reas
 const startBoard = () => api(withBoard('/start'), { method: 'POST' })
 const putMaxParallel = value => api(withBoard('/max-parallel'), { method: 'PUT', body: { value } })
 const putBoardModel = (model, provider) => api(withBoard('/model'), { method: 'PUT', body: { model, provider } })
-const fetchTaskLog = id =>
-  api(withBoard(`/tasks/${encodeURIComponent(id)}/log`, { tail: '1048576', timestamps: 'true' }))
+// Two tails, because the two views want different things. The task drawer
+// wants a glance — core's own drawer asks for the same 16 KiB — and polls it
+// every three seconds; the overlay wants the archive and is opened on purpose.
+// Stamps ride along only where there is a gutter to put them in.
+const SMALL_LOG_TAIL = 16_384
+const FULL_LOG_TAIL = 1_048_576
+const fetchTaskLog = (id, full) =>
+  api(
+    withBoard(`/tasks/${encodeURIComponent(id)}/log`, {
+      tail: String(full ? FULL_LOG_TAIL : SMALL_LOG_TAIL),
+      timestamps: full ? 'true' : 'false'
+    })
+  )
 const fetchTaskContext = id => api(withBoard(`/tasks/${encodeURIComponent(id)}/context`))
 const fetchTaskDetail = id => api(withBoard(`/tasks/${encodeURIComponent(id)}`))
 const patchTask = (id, patch) =>
   api(withBoard(`/tasks/${encodeURIComponent(id)}`), { method: 'PATCH', body: patch })
 const postComment = (id, body) =>
   api(withBoard(`/tasks/${encodeURIComponent(id)}/comments`), { method: 'POST', body: { author: 'desktop', body } })
+const fetchAssignees = () => api(withBoard('/assignees'))
+const createTask = body => api(withBoard('/tasks'), { method: 'POST', body })
 
 // The board directory itself. `ctx.rest` cannot leave this plugin's namespace,
 // so these mirror core's own `/boards` endpoints rather than borrowing them.
@@ -295,6 +309,57 @@ function localDayKey(date) {
 }
 
 /**
+ * What a terminal would still show after a line's carriage returns: the last
+ * frame that actually wrote something.
+ *
+ * Reading it as "everything after the last \r" is what blanked the log. A
+ * worker's stdout is a TEXT stream, so on Windows every `\n` it writes becomes
+ * `\r\n` — and a line the worker echoed from a child process (already CRLF)
+ * reaches the file as `\r\r\n`. Slice after the last `\r` there and every
+ * single line comes out empty: 26 KiB of log, 300 blank rows, nothing on
+ * screen. A `\r` with nothing behind it parks the cursor; it erases nothing.
+ */
+export function collapseCarriageReturns(line) {
+  if (!line.includes('\r')) {
+    return line
+  }
+
+  const frames = line.split('\r')
+
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    if (frames[index] !== '') {
+      return frames[index]
+    }
+  }
+
+  return ''
+}
+
+/** One raw log line as it deserves to be read: no progress frames, no ANSI. */
+export function logLineText(line) {
+  return stripAnsi(collapseCarriageReturns(String(line ?? '')))
+}
+
+/**
+ * The log as plain text: stamps dropped, every line sanitised, nothing else
+ * touched. This is what the small view renders — one `whitespace-pre-wrap`
+ * block, the shape core's own task drawer uses — so a screenful of log costs
+ * one DOM node instead of one per line.
+ */
+export function plainLogText(content) {
+  const text = String(content ?? '')
+
+  if (!text) {
+    return ''
+  }
+
+  return text
+    .split('\n')
+    .map(line => logLineText(line.startsWith('[') ? line.replace(STAMP_RE, '') : line))
+    .join('\n')
+}
+
+/**
  * Split a stamped log into display rows: one `{kind:'line'}` per line, plus a
  * `{kind:'day'}` divider whenever the LOCAL date changes. A line's carriage
  * returns collapse to what a terminal would show last (progress bars), and
@@ -316,7 +381,7 @@ export function buildLogRows(content) {
   let lastIso = ''
 
   for (const raw of lines) {
-    let line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+    let line = raw
     const match = STAMP_RE.exec(line)
     let iso = null
     let at = null
@@ -331,8 +396,7 @@ export function buildLogRows(content) {
       }
     }
 
-    const cr = line.lastIndexOf('\r')
-    const text = stripAnsi(cr >= 0 ? line.slice(cr + 1) : line)
+    const text = logLineText(line)
 
     if (!iso || !at) {
       rows.push({ iso: null, kind: 'line', repeat: false, text, time: '', title: '' })
@@ -813,11 +877,13 @@ function TaskContextMeter({ running, taskId }) {
 }
 
 // ── worker log ───────────────────────────────────────────────────────────────
-// Two views of the same file. The task view carries the SMALL one — the tail,
-// plain, enough to see what the worker is doing without pushing the task's own
-// fields off screen. The four-arrow button in its header swaps it for the FULL
-// one: every line the backend sent, with the write-time gutter and the day
-// dividers, filling the page until Esc (or the button) gives the details back.
+// Two views of the same file, and they fetch differently on purpose. The task
+// view carries the SMALL one: core's own 16 KiB tail, unstamped, rendered as
+// ONE block of wrapped text — a glance at what the worker is doing, cheap
+// enough to poll every three seconds. The four-arrow button in its header swaps
+// it for the FULL one: a megabyte of tail with the write-time gutter and the
+// day dividers, filling the page until Esc (or the button) gives the details
+// back.
 
 const LogLine = memo(function LogLine({ row }) {
   return jsxs(Fragment, {
@@ -841,10 +907,10 @@ const LogLine = memo(function LogLine({ row }) {
 })
 
 /**
- * Keep only the last `limit` lines of a log. The small view is a glance, not an
- * archive: rendering a 1 MiB tail into a 12rem box costs thousands of nodes
- * nobody scrolls to. Works on the raw text so the stamps survive for the rows
- * that are kept.
+ * Keep only the last `limit` lines of a log. A megabyte of tail is tens of
+ * thousands of lines, and a two-column grid that big takes seconds to lay out
+ * — the full view draws the newest slice of it instead. Works on the raw text
+ * so the stamps survive for the rows that are kept.
  */
 export function logTail(content, limit) {
   const text = String(content ?? '')
@@ -870,8 +936,10 @@ export function logTail(content, limit) {
   return trailing ? `${kept.join('\n')}\n` : kept.join('\n')
 }
 
-/** Lines the small log keeps — roughly a screenful and a half of scrollback. */
-const SMALL_LOG_LINES = 300
+/** Lines the full view draws. Beyond this the grid costs more to lay out than
+ *  anybody gains from scrolling it; the byte tail above it is the real archive
+ *  and `gekürzt` in the header says when either one bit. */
+const FULL_LOG_LINES = 5_000
 
 /** The log band inside the task drawer, inline for the reason in the file
  *  header. 200px is about a dozen lines — the difference between a glance and a
@@ -884,27 +952,32 @@ const SMALL_LOG_STYLE = { maxHeight: '20rem', minHeight: '200px' }
 const FULL_LOG_STYLE = { lineHeight: 1.6 }
 
 /**
- * The log as a two-column timeline: write time left, text right, day dividers.
- * `compact` drops the gutter and the dividers — the small view has no room for
- * a time column, and the full view is one button away.
+ * The small view: the tail as one wrapped block of monospace text, which is
+ * exactly what core's task drawer does with it. No gutter, no dividers and no
+ * node per line — the four-arrow button is one click away for all three.
  */
-function TimestampedLog({ compact = false, content }) {
+function PlainLog({ text }) {
+  if (!text.trim()) {
+    return jsx('div', { className: 'font-mono text-[0.75rem] text-(--ui-text-quaternary)', children: '—' })
+  }
+
+  return jsx('div', {
+    className:
+      'font-mono text-[0.6875rem] leading-[1.55] break-words whitespace-pre-wrap text-(--ui-text-tertiary)',
+    'data-selectable-text': 'true',
+    children: text
+  })
+}
+
+/**
+ * The full view: a two-column timeline — write time left, text right, a divider
+ * whenever the local date turns over.
+ */
+function TimestampedLog({ content }) {
   const rows = useMemo(() => buildLogRows(content), [content])
 
   if (!rows.length) {
     return jsx('div', { className: 'font-mono text-[0.75rem] text-(--ui-text-quaternary)', children: '—' })
-  }
-
-  if (compact) {
-    return jsx('div', {
-      className: 'flex flex-col font-mono text-[0.6875rem] leading-[1.55] text-(--ui-text-tertiary)',
-      'data-selectable-text': 'true',
-      children: rows
-        .filter(row => row.kind === 'line')
-        .map((row, index) =>
-          jsx('span', { className: 'break-words whitespace-pre-wrap', children: row.text || ' ' }, index)
-        )
-    })
   }
 
   return jsx('div', {
@@ -935,27 +1008,37 @@ function TimestampedLog({ compact = false, content }) {
 /** Pixels from the bottom that still count as "following" the tail. */
 const FOLLOW_SLACK_PX = 48
 
-/** The selected task's log — fast poll while it runs, slow once it is done. */
-function useTaskLog(task) {
+/**
+ * The selected task's log — fast poll while it runs, slow once it is done.
+ * `full` picks the megabyte-and-stamps variant the overlay reads; the two are
+ * separate cache entries, so the drawer keeps polling its cheap tail while the
+ * overlay is closed.
+ */
+function useTaskLog(task, { full = false, paused = false } = {}) {
   const slug = useValue($boardSlug)
 
   return useQuery({
-    enabled: Boolean(task?.id),
-    queryFn: () => fetchTaskLog(task.id),
-    queryKey: logKey(slug, task?.id ?? ''),
+    enabled: Boolean(task?.id) && !paused,
+    queryFn: () => fetchTaskLog(task.id, full),
+    queryKey: logKey(slug, task?.id ?? '', full ? 'full' : 'tail'),
     refetchInterval: task?.status === 'running' ? 3_000 : 15_000
   })
 }
 
-/** `1.2 MiB · gekürzt` — what of the file actually arrived. */
-function logMeta(log) {
+/**
+ * `1.2 MiB · gekürzt` — what of the file actually arrived. Both cuts read the
+ * same: the backend's byte tail (`log.truncated`) and the line budget the full
+ * view draws (`clipped`) leave the reader in the same place, at the newest end
+ * of a file that has more above it.
+ */
+function logMeta(log, clipped = false) {
   const parts = []
 
   if (log?.size_bytes != null) {
     parts.push(formatBytes(log.size_bytes))
   }
 
-  if (log?.truncated) {
+  if (log?.truncated || clipped) {
     parts.push('gekürzt')
   }
 
@@ -1028,10 +1111,11 @@ function LogSizeButton({ expanded, onClick }) {
 }
 
 /** The small log inside the task view: the tail, plain, one button from full. */
-function TaskLogSection({ onExpand, task }) {
-  const { data: log, error, isLoading } = useTaskLog(task)
+function TaskLogSection({ expanded, onExpand, task }) {
+  // Nothing behind the overlay is worth a request every three seconds.
+  const { data: log, error, isLoading } = useTaskLog(task, { paused: expanded })
   const meta = logMeta(log)
-  const tail = useMemo(() => logTail(log?.content ?? '', SMALL_LOG_LINES), [log?.content])
+  const text = useMemo(() => plainLogText(log?.content ?? ''), [log?.content])
   const placeholder = jsx(LogPlaceholder, { error, isLoading, log })
 
   return jsxs(Section, {
@@ -1055,8 +1139,8 @@ function TaskLogSection({ onExpand, task }) {
         placeholder ??
         jsx(LogScroller, {
           className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-2 py-1.5',
-          content: tail,
-          children: jsx(TimestampedLog, { compact: true, content: tail })
+          content: text,
+          children: jsx(PlainLog, { text })
         })
     })
   })
@@ -1068,8 +1152,10 @@ function TaskLogSection({ onExpand, task }) {
  * inward — puts the task's details back.
  */
 function LogOverlay({ onClose, task }) {
-  const { data: log, error, isLoading } = useTaskLog(task)
-  const meta = logMeta(log)
+  const { data: log, error, isLoading } = useTaskLog(task, { full: true })
+  const content = log?.content ?? ''
+  const shown = useMemo(() => logTail(content, FULL_LOG_LINES), [content])
+  const meta = logMeta(log, shown.length < content.length)
   const placeholder = jsx(LogPlaceholder, { error, isLoading, log })
 
   // `inset-0` of the PAGE root (which clips): exactly the space Kanban+ owns,
@@ -1121,8 +1207,8 @@ function LogOverlay({ onClose, task }) {
         ? jsx('div', { className: 'grid min-h-0 flex-1 place-items-center p-6', children: placeholder })
         : jsx(LogScroller, {
             className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-4 py-3',
-            content: log?.content,
-            children: jsx(TimestampedLog, { content: log?.content ?? '' })
+            content: shown,
+            children: jsx(TimestampedLog, { content: shown })
           })
     ]
   })
@@ -2389,6 +2475,353 @@ function useTaskMove() {
   })
 }
 
+// ── adding a task to a lane ──────────────────────────────────────────────────
+// Core's per-lane add, ported: the dashed `+` at the foot of a lane opens the
+// same dialog with that lane as its target. Creating is delegated to core's
+// kanban API (see the backend's `POST /tasks`), so the defaults, the
+// validation and the dispatcher-presence warning are the ones every other
+// surface gets — this page only decides which lane the card lands in.
+
+/** Workspace kinds core's create accepts, in core's order. */
+const WORKSPACE_KINDS = ['scratch', 'worktree', 'dir']
+
+/** `Select` cannot hold an empty value, so "inherit" and "none" need names. */
+const INHERIT = '__inherit__'
+const NO_PARENT = '__none__'
+
+/** Comma-separated skills, trimmed, empties dropped: `a, ,b ` → `['a','b']`. */
+export function parseSkills(text) {
+  return String(text ?? '')
+    .split(',')
+    .map(skill => skill.trim())
+    .filter(Boolean)
+}
+
+/**
+ * The payload the dialog posts. Pure, so what the backend is asked for is
+ * assertable without a dialog: every empty field is LEFT OUT rather than sent
+ * as `''`, because the backend hands what it gets to core, and core reads a
+ * present-but-empty field as "no, really, nothing" where it would otherwise
+ * inherit the board's default.
+ */
+export function newTaskPayload(form, status) {
+  const body = { priority: Number(form.priority) || 0, title: String(form.title ?? '').trim() }
+  const description = String(form.body ?? '').trim()
+  const skills = parseSkills(form.skills)
+  const path = String(form.workspacePath ?? '').trim()
+
+  if (status) {
+    body.status = status
+  }
+
+  if (description) {
+    body.body = description
+  }
+
+  // No assignee at all, rather than an empty one: the dispatcher fills an
+  // unassigned ready task from `kanban.default_assignee` on its next tick, and
+  // that fallback stays live in a way a name resolved here would not.
+  if (form.assignee && form.assignee !== INHERIT) {
+    body.assignee = form.assignee
+  }
+
+  if (form.workspaceKind && form.workspaceKind !== INHERIT) {
+    body.workspace_kind = form.workspaceKind
+  }
+
+  if (path && form.workspaceKind !== 'scratch') {
+    body.workspace_path = path
+  }
+
+  if (skills.length) {
+    body.skills = skills
+  }
+
+  if (form.parent) {
+    body.parents = [form.parent]
+  }
+
+  if (form.goalMode) {
+    body.goal_mode = true
+  }
+
+  if (form.model?.model) {
+    body.model_override = form.model.model
+
+    if (form.model.provider) {
+      body.provider_override = form.model.provider
+    }
+  }
+
+  return body
+}
+
+/** `ModelPicker` reads `current.model` — it wants the pair, never a null. */
+const EMPTY_MODEL = { model: '', provider: '' }
+
+const EMPTY_FORM = {
+  assignee: INHERIT,
+  body: '',
+  goalMode: false,
+  model: EMPTY_MODEL,
+  parent: '',
+  priority: '0',
+  skills: '',
+  title: '',
+  workspaceKind: INHERIT,
+  workspacePath: ''
+}
+
+/** The dialog's scrolling body, inline for the reason in the file header: a
+ *  height Tailwind would have to generate for us is a height we do not get, and
+ *  without one a long form pushes its own footer off the screen. */
+const NEW_TASK_BODY_STYLE = { maxHeight: '60vh' }
+
+/** A labelled field in the dialog — the label style the board dialogs use. */
+function DialogField({ children, hint, label }) {
+  return jsxs('label', {
+    className: 'flex min-w-0 flex-col gap-1',
+    children: [
+      jsx('span', { className: FIELD_LABEL, children: label }),
+      children,
+      hint ? jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: hint }) : null
+    ]
+  })
+}
+
+/** The roster core's picker offers: profiles on disk ∪ this board's assignees. */
+function useAssignees(enabled) {
+  const slug = useValue($boardSlug)
+
+  return useQuery({
+    enabled,
+    queryFn: fetchAssignees,
+    queryKey: assigneesKey(slug),
+    staleTime: 30_000
+  })
+}
+
+/**
+ * The dialog itself. `target` is both the lane the task lands in and the open
+ * flag: a lane means open, `null` means closed, and every field resets on the
+ * way in so the next add never inherits the last one's answers.
+ */
+function NewTaskDialog({ onClose, parents, target }) {
+  const qc = useQueryClient()
+  const [form, setForm] = useState(EMPTY_FORM)
+  const [error, setError] = useState(null)
+  const open = Boolean(target)
+  const { data: roster } = useAssignees(open)
+  const set = (field, value) => setForm(previous => ({ ...previous, [field]: value }))
+
+  useEffect(() => {
+    if (open) {
+      setForm(EMPTY_FORM)
+      setError(null)
+    }
+  }, [open])
+
+  const create = useMutation({
+    mutationFn: () => createTask(newTaskPayload(form, target)),
+    onError: err => setError(errText(err)),
+    onSuccess: result => {
+      // The backend warns rather than fails when the new task would sit idle
+      // (no dispatcher) or when the move into the lane was refused — both are
+      // things to say out loud, neither is a reason to keep the dialog open.
+      if (result?.warning) {
+        host.notify({ kind: 'warning', message: result.warning })
+      } else {
+        host.notify({ kind: 'info', message: `Angelegt in ${columnMeta(target).label}` })
+      }
+
+      refreshAll(qc)
+      onClose()
+    }
+  })
+
+  const title = form.title.trim()
+  const submit = () => title && !create.isPending && create.mutate()
+
+  return jsx(Dialog, {
+    onOpenChange: next => !next && onClose(),
+    open,
+    children: jsxs(DialogContent, {
+      className: 'max-w-lg',
+      children: [
+        jsx(DialogHeader, {
+          children: jsx(DialogTitle, {
+            children: target ? `Neue Aufgabe in ${columnMeta(target).label}` : 'Neue Aufgabe'
+          })
+        }),
+        jsxs('div', {
+          className: 'flex flex-col gap-3 overflow-y-auto pr-0.5',
+          style: NEW_TASK_BODY_STYLE,
+          children: [
+            jsx(DialogField, {
+              label: 'Titel',
+              children: jsx(Input, {
+                autoFocus: true,
+                onChange: event => set('title', event.target.value),
+                onKeyDown: event => isSubmitEnter(event) && submit(),
+                placeholder: 'Was soll getan werden?',
+                value: form.title
+              })
+            }),
+            jsx(DialogField, {
+              label: 'Beschreibung',
+              children: jsx(PlainTextarea, {
+                onChange: event => set('body', event.target.value),
+                placeholder: 'Kontext, Akzeptanzkriterien, Links …',
+                rows: 4,
+                value: form.body
+              })
+            }),
+            jsxs('div', {
+              className: 'grid grid-cols-2 gap-3',
+              children: [
+                jsx(DialogField, {
+                  label: 'Priorität',
+                  children: jsx(Input, {
+                    onChange: event => set('priority', event.target.value),
+                    type: 'number',
+                    value: form.priority
+                  })
+                }),
+                jsx(DialogField, {
+                  label: 'Workspace',
+                  children: jsxs(Select, {
+                    onValueChange: value => set('workspaceKind', value),
+                    value: form.workspaceKind,
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                      jsxs(SelectContent, {
+                        children: [
+                          jsx(SelectItem, { value: INHERIT, children: 'Board-Vorgabe' }),
+                          WORKSPACE_KINDS.map(kind => jsx(SelectItem, { value: kind, children: kind }, kind))
+                        ]
+                      })
+                    ]
+                  })
+                })
+              ]
+            }),
+            form.workspaceKind === 'worktree' || form.workspaceKind === 'dir'
+              ? jsx(DialogField, {
+                  hint: 'Leer = das Arbeitsverzeichnis des Boards.',
+                  label: 'Workspace-Pfad',
+                  children: jsx(Input, {
+                    onChange: event => set('workspacePath', event.target.value),
+                    placeholder: 'Pfad zum Repo oder Verzeichnis',
+                    value: form.workspacePath
+                  })
+                })
+              : null,
+            jsx(DialogField, {
+              hint: 'Ohne Auswahl vergibt der Dispatcher `kanban.default_assignee`.',
+              label: 'Worker',
+              children: jsxs(Select, {
+                onValueChange: value => set('assignee', value),
+                value: form.assignee,
+                children: [
+                  jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                  jsxs(SelectContent, {
+                    children: [
+                      jsx(SelectItem, { value: INHERIT, children: 'Dispatcher-Vorgabe' }),
+                      (roster?.assignees ?? []).map(entry =>
+                        jsx(SelectItem, { value: entry.name, children: entry.name }, entry.name)
+                      )
+                    ]
+                  })
+                ]
+              })
+            }),
+            jsx(DialogField, {
+              hint: 'Komma-getrennt, z. B. `python, review`.',
+              label: 'Skills',
+              children: jsx(Input, {
+                onChange: event => set('skills', event.target.value),
+                placeholder: 'optional',
+                value: form.skills
+              })
+            }),
+            jsx(DialogField, {
+              label: 'Modell',
+              children: jsxs('div', {
+                className: 'flex min-w-0 items-center gap-1',
+                children: [
+                  jsx(ModelPicker, {
+                    ariaLabel: 'Modell für diesen Task',
+                    current: form.model,
+                    inheritCopy: MODEL_INHERIT,
+                    onPick: (model, provider) => set('model', { model, provider }),
+                    triggerClassName: 'min-w-0 flex-1'
+                  }),
+                  jsx(ClearModelButton, {
+                    label: 'Modell zurücksetzen',
+                    onClear: () => set('model', EMPTY_MODEL),
+                    shown: Boolean(String(form.model.model).trim())
+                  })
+                ]
+              })
+            }),
+            parents.length > 0
+              ? jsx(DialogField, {
+                  hint: 'Der Task bleibt in Todo, bis der übergeordnete fertig ist.',
+                  label: 'Hängt ab von',
+                  children: jsxs(Select, {
+                    onValueChange: value => set('parent', value === NO_PARENT ? '' : value),
+                    value: form.parent || NO_PARENT,
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                      jsxs(SelectContent, {
+                        children: [
+                          jsx(SelectItem, { value: NO_PARENT, children: 'Nichts' }),
+                          parents.map(option =>
+                            jsx(SelectItem, { value: option.id, children: option.title || option.id }, option.id)
+                          )
+                        ]
+                      })
+                    ]
+                  })
+                })
+              : null,
+            // A codicon toggle, not the SDK's `Switch` and not a bare
+            // checkbox: one named import this plugin cannot count on across
+            // Hermes versions fails the whole file at load, and a raw checkbox
+            // has no rule of Hermes' to borrow (the app only ships `Switch`),
+            // so it would render as the browser's.
+            jsxs('button', {
+              'aria-checked': form.goalMode,
+              className: cn(
+                'flex w-fit cursor-pointer items-center gap-2 rounded-md py-1 text-[0.75rem] transition-colors',
+                form.goalMode ? 'text-foreground' : 'text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)'
+              ),
+              onClick: () => set('goalMode', !form.goalMode),
+              role: 'switch',
+              type: 'button',
+              children: [
+                jsx(Codicon, { name: form.goalMode ? 'pass' : 'circle-outline', size: '0.85rem' }),
+                'Ziel-Modus (der Worker prüft sein Ergebnis selbst)'
+              ]
+            }),
+            error ? jsx('span', { className: 'text-[0.75rem] text-destructive', children: error }) : null
+          ]
+        }),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { onClick: onClose, variant: 'text', children: 'Abbrechen' }),
+            jsx(Button, {
+              disabled: !title || create.isPending,
+              onClick: submit,
+              children: create.isPending ? 'Wird angelegt …' : 'Aufgabe anlegen'
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
 // ── the card's right-click menu ──────────────────────────────────────────────
 // Hand-rolled on purpose: the SDK's ContextMenu is not part of the export
 // surface this plugin can count on across the Hermes versions it must keep
@@ -2619,7 +3052,7 @@ function BoardCard({ columns, now, onMove, onSelect, selected, task }) {
 const RAIL_STYLE = { width: '2.25rem' }
 const RAIL_LABEL_STYLE = { writingMode: 'vertical-rl' }
 
-function BoardColumn({ collapsed, column, columns, now, onMove, onSelect, onToggle, selectedId }) {
+function BoardColumn({ collapsed, column, columns, now, onAdd, onMove, onSelect, onToggle, selectedId }) {
   const [over, setOver] = useState(false)
   const meta = columnMeta(column.name)
   const locked = isLockedTarget(column.name)
@@ -2747,14 +3180,31 @@ function BoardColumn({ collapsed, column, columns, now, onMove, onSelect, onTogg
           })
         ]
       }),
-      jsx('div', {
+      jsxs('div', {
         className: 'flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto pb-2',
-        children:
+        children: [
           tasks.length === 0
             ? jsx('span', { className: 'px-0.5 text-[0.6875rem] text-(--ui-text-quaternary)', children: '—' })
             : tasks.map(task =>
                 jsx(BoardCard, { columns, now, onMove, onSelect, selected: task.id === selectedId, task }, task.id)
-              )
+              ),
+          // Core's Jira-style lane add, at the foot of the cards. A locked lane
+          // gets none: the dispatcher hands those out, and an add that cannot
+          // land is worse than no button. Always drawn rather than revealed on
+          // hover — the same call this file makes for the fold chevron: a
+          // control you need should not be a control you have to find.
+          locked
+            ? null
+            : jsx('button', {
+                'aria-label': `Neue Aufgabe in ${meta.label}`,
+                className:
+                  'flex shrink-0 cursor-pointer items-center justify-center gap-1 rounded-md border border-dashed border-(--ui-stroke-tertiary) py-1.5 text-[0.6875rem] text-(--ui-text-quaternary) transition-colors hover:border-(--ui-stroke-secondary) hover:bg-(--chrome-action-hover) hover:text-foreground',
+                onClick: () => onAdd(column.name),
+                title: `Neue Aufgabe in ${meta.label}`,
+                type: 'button',
+                children: [jsx(Codicon, { name: 'add', size: '0.75rem' }), 'Aufgabe']
+              })
+        ]
       })
     ]
   })
@@ -2763,7 +3213,7 @@ function BoardColumn({ collapsed, column, columns, now, onMove, onSelect, onTogg
 /** The whole board, one lane per status, scrolling sideways when it is wider
  *  than the page. The page owns the query — it needs the same cards to resolve
  *  a selection the drawer opens on. */
-function BoardColumns({ board, error, isLoading, now, onMove, onSelect, selectedId }) {
+function BoardColumns({ board, error, isLoading, now, onAdd, onMove, onSelect, selectedId }) {
   const columns = board?.columns ?? []
   const names = useMemo(() => columns.map(column => column.name), [columns])
   const overrides = useValue($collapsedLanes)
@@ -2796,9 +3246,19 @@ function BoardColumns({ board, error, isLoading, now, onMove, onSelect, selected
   if (columns.every(column => (column.tasks?.length ?? 0) === 0)) {
     return jsx('div', {
       className: 'grid h-full place-items-center p-4',
-      children: jsx(EmptyState, {
-        description: 'Dieses Board hat noch keine Tasks. Lege einen an — auf der Kanban-Seite oder mit `hermes kanban add`.',
-        title: 'Leeres Board'
+      children: jsxs('div', {
+        className: 'flex flex-col items-center gap-3',
+        children: [
+          jsx(EmptyState, {
+            description: 'Dieses Board hat noch keine Tasks.',
+            title: 'Leeres Board'
+          }),
+          jsxs(Button, {
+            onClick: () => onAdd('ready'),
+            size: 'sm',
+            children: [jsx(Codicon, { name: 'add', size: '0.8rem' }), 'Erste Aufgabe anlegen']
+          })
+        ]
       })
     })
   }
@@ -2814,6 +3274,7 @@ function BoardColumns({ board, error, isLoading, now, onMove, onSelect, selected
           column,
           columns: names,
           now,
+          onAdd,
           onMove,
           onSelect,
           onToggle: () =>
@@ -3338,7 +3799,7 @@ const PANEL_STYLE = {
   width: 'min(100%, max(22rem, 33.3333%))'
 }
 
-function TaskDetailPanel({ card, columns, onClose, onExpandLog, onOpen, taskId }) {
+function TaskDetailPanel({ card, columns, logExpanded, onClose, onExpandLog, onOpen, taskId }) {
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
   const move = useTaskMove()
@@ -3457,7 +3918,7 @@ function TaskDetailPanel({ card, columns, onClose, onExpandLog, onOpen, taskId }
                       })
                     : null,
                   jsx(LinksSection, { links: detail?.links, onOpen }),
-                  jsx(TaskLogSection, { onExpand: onExpandLog, task: task ?? { id: taskId } }),
+                  jsx(TaskLogSection, { expanded: logExpanded, onExpand: onExpandLog, task: task ?? { id: taskId } }),
                   jsx(CommentsSection, {
                     comments: detail?.comments ?? [],
                     disabled: comment.isPending,
@@ -3484,11 +3945,17 @@ function KanbanPlusPage() {
   // The worker log, blown up over the whole page. Off by default; Esc and the
   // same four-arrow button both put the task's details back.
   const [logExpanded, setLogExpanded] = useState(false)
+  // The lane a `+` was clicked in — the new-task dialog's target AND its open
+  // flag, so there is no second piece of state to keep in step with it.
+  const [addLane, setAddLane] = useState(null)
   const move = useTaskMove()
 
   // A task id belongs to the board it came from, so a switch re-reads THAT
   // board's remembered selection instead of pointing at a task it never had.
-  useEffect(() => setSelectedId(readSelectedTask(slug)), [slug])
+  useEffect(() => {
+    setSelectedId(readSelectedTask(slug))
+    setAddLane(null)
+  }, [slug])
 
   const {
     data: state,
@@ -3518,6 +3985,15 @@ function KanbanPlusPage() {
 
   const running = useMemo(() => tasks?.running ?? [], [tasks])
   const recent = useMemo(() => tasks?.recent ?? [], [tasks])
+  // Every card on the board is a candidate parent for a new task, the way
+  // core's create dialog offers them.
+  const parentOptions = useMemo(
+    () =>
+      (board?.columns ?? [])
+        .flatMap(column => column.tasks ?? [])
+        .map(task => ({ id: task.id, title: task.title })),
+    [board]
+  )
   const columnNames = useMemo(() => {
     const names = (board?.columns ?? []).map(column => column.name)
 
@@ -3665,6 +4141,7 @@ function KanbanPlusPage() {
               error: boardError,
               isLoading: boardLoading,
               now,
+              onAdd: setAddLane,
               onMove: (id, status) => move.mutate({ id, status }),
               onSelect: select,
               selectedId
@@ -3676,6 +4153,7 @@ function KanbanPlusPage() {
                 {
                   card: selected,
                   columns: columnNames,
+                  logExpanded,
                   onClose: () => select(null),
                   onExpandLog: () => setLogExpanded(true),
                   onOpen: select,
@@ -3686,6 +4164,7 @@ function KanbanPlusPage() {
             : null
         ]
       }),
+      jsx(NewTaskDialog, { onClose: () => setAddLane(null), parents: parentOptions, target: addLane }),
       logExpanded && (selected || selectedId)
         ? jsx(LogOverlay, {
             onClose: () => setLogExpanded(false),
