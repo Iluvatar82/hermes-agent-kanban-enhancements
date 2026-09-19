@@ -33,6 +33,14 @@
  * width of its own. Anything load-bearing — the drawer's width, the log's
  * height, the folded lane's rail — therefore goes through an inline `style`,
  * where nothing has to be generated for it to apply.
+ *
+ * ── AND A RULE ABOUT ELEMENTS ───────────────────────────────────────────────
+ * `jsx(Component, …)` builds an element OBJECT. It is truthy even when that
+ * component renders nothing, so it can be rendered but never asked whether it
+ * amounts to anything: `const x = jsx(Maybe, …)` followed by `x ?? theRealThing`
+ * always picks `x`. Anything a branch has to decide on is a plain function
+ * returning an element or `null` — see `logPlaceholder`, where reading that
+ * wrong cost the worker log every line it had.
  */
 
 import {
@@ -1100,8 +1108,19 @@ function LogScroller({ children, className, content }) {
   })
 }
 
-/** Loader / error / "no log yet" — the three states that are not a log. */
-function LogPlaceholder({ error, isLoading, log }) {
+/**
+ * Loader / error / "no log yet" — the three states that are NOT a log, and
+ * `null` when there is one.
+ *
+ * A plain function, deliberately not a component. Both views below pick
+ * between this and the log itself, and `jsx(SomeComponent, …)` is an element
+ * OBJECT: truthy even when that component goes on to render nothing. Written
+ * as `const placeholder = jsx(LogPlaceholder, …)`, `placeholder ?? theLog`
+ * therefore never reached the log — the whole worker log, small view and
+ * overlay alike, was an empty box under a header that correctly said 26 KiB.
+ * A function returns the null the callers actually test for.
+ */
+export function logPlaceholder({ error, isLoading, log }) {
   if (isLoading && !log) {
     return jsx('div', { className: 'grid h-full place-items-center py-4', children: jsx(Loader, {}) })
   }
@@ -1140,7 +1159,7 @@ function TaskLogSection({ expanded, onExpand, task }) {
   const { data: log, error, isLoading } = useTaskLog(task, { paused: expanded })
   const meta = logMeta(log)
   const text = useMemo(() => plainLogText(log?.content ?? ''), [log?.content])
-  const placeholder = jsx(LogPlaceholder, { error, isLoading, log })
+  const placeholder = logPlaceholder({ error, isLoading, log })
 
   return jsxs(Section, {
     action: jsxs('div', {
@@ -1180,7 +1199,7 @@ function LogOverlay({ onClose, task }) {
   const content = log?.content ?? ''
   const shown = useMemo(() => logTail(content, FULL_LOG_LINES), [content])
   const meta = logMeta(log, shown.length < content.length)
-  const placeholder = jsx(LogPlaceholder, { error, isLoading, log })
+  const placeholder = logPlaceholder({ error, isLoading, log })
 
   // `inset-0` of the PAGE root (which clips): exactly the space Kanban+ owns,
   // never the window. Lines wrap rather than scroll sideways, so the only

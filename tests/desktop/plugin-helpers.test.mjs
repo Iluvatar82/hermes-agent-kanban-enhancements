@@ -569,6 +569,36 @@ describe('logTail', () => {
   })
 })
 
+describe('logPlaceholder', () => {
+  // The bug this guards: as a COMPONENT, `jsx(LogPlaceholder, …)` handed both
+  // log views an element object that is truthy even in the "there is a log"
+  // case, so `placeholder ?? theLog` never reached the log. Small view and
+  // overlay were empty boxes under a header that correctly reported the size.
+  it('is null once a log arrived, so the views can draw it', () => {
+    const log = { content: 'worker starting\n', exists: true, size_bytes: 26_731 }
+
+    assert.equal(plugin.logPlaceholder({ error: null, isLoading: false, log }), null)
+    // Still null while a poll refreshes a log that is already on screen.
+    assert.equal(plugin.logPlaceholder({ error: null, isLoading: true, log }), null)
+  })
+
+  it('shows the loader only before the first answer', () => {
+    const element = plugin.logPlaceholder({ error: null, isLoading: true, log: undefined })
+
+    assert.equal(element.type, 'div')
+    assert.equal(element.props.children.type.__stub, 'Loader')
+  })
+
+  it('shows the error and the missing-file state', () => {
+    const failed = plugin.logPlaceholder({ error: new Error('boom'), isLoading: false, log: undefined })
+    const missing = plugin.logPlaceholder({ error: null, isLoading: false, log: { exists: false } })
+
+    assert.equal(failed.type.__stub, 'ErrorState')
+    assert.equal(failed.props.description, 'boom')
+    assert.equal(missing.type.__stub, 'EmptyState')
+  })
+})
+
 describe('drop targets', () => {
   it('refuses the lanes the dispatcher owns', () => {
     assert.equal(plugin.isLockedTarget('running'), true)
@@ -661,22 +691,46 @@ describe('versionLabel', () => {
 })
 
 describe('element construction', () => {
+  // These guards read the SHIPPED code: a comment that talks about a mistake —
+  // and the ones below are documented where they were made — is prose, not a
+  // second helping of the bug.
+  const code = readFileSync(pluginFile, 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+
   // `jsx(Component)` without a props object throws "Cannot read properties of
   // undefined (reading 'key')" inside React's real runtime and takes the whole
   // page down — the stub above is too forgiving to catch it, so read the source.
   it('never calls jsx() without a props object', () => {
-    const source = readFileSync(pluginFile, 'utf8')
-    const offenders = [...source.matchAll(/\bjsxs?\(\s*[A-Za-z_$][\w$.]*\s*\)/g)].map(match => match[0])
+    const offenders = [...code.matchAll(/\bjsxs?\(\s*[A-Za-z_$][\w$.]*\s*\)/g)].map(match => match[0])
 
     assert.deepEqual(offenders, [])
+  })
+
+  // `jsx(Component, …)` builds an element OBJECT — truthy even when that
+  // component goes on to render nothing. `const placeholder = jsx(LogPlaceholder,
+  // …)` followed by `placeholder ?? theLog` is what left BOTH worker-log views
+  // empty: the branch that draws the log was unreachable. An element is
+  // something to render, never something to ask whether it exists.
+  it('never decides a branch on an element object', () => {
+    const tested = text =>
+      [...text.matchAll(/\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*jsxs?\(/g)]
+        .map(match => match[1])
+        .filter(name =>
+          new RegExp(`!\\s*${name}\\b|\\b${name}\\s*(?:\\?\\?|\\?(?![.?])|&&|\\|\\|)`).test(text))
+
+    // The detector, against the bug it exists for and against a legitimate use.
+    assert.deepEqual(tested('const placeholder = jsx(P, {})\nreturn placeholder ?? log'), ['placeholder'])
+    assert.deepEqual(tested("const bar = jsxs('div', {})\nreturn jsx('p', { children: bar })"), [])
+
+    assert.deepEqual(tested(code), [])
   })
 
   // `jsx(Typo, …)` is a ReferenceError the moment that branch renders, which
   // can be a task view nobody opened during a smoke test. The stub SDK is far
   // too forgiving to catch it, so the names are checked against the source.
   it('only builds elements from components this file actually has', () => {
-    const source = readFileSync(pluginFile, 'utf8')
-    const names = pattern => new Set([...source.matchAll(pattern)].map(match => match[1]))
+    const names = pattern => new Set([...code.matchAll(pattern)].map(match => match[1]))
 
     const declared = new Set([
       // `function X(` / `export function X(`
@@ -684,7 +738,7 @@ describe('element construction', () => {
       // `const X = …` at module scope (memo() components, atoms, constants)
       ...names(/^(?:export )?const ([A-Za-z_$][\w$]*) =/gm),
       // Everything imported — the SDK block, react, react/jsx-runtime.
-      ...[...source.matchAll(/import\s*\{([^}]*)\}\s*from/g)].flatMap(match =>
+      ...[...code.matchAll(/import\s*\{([^}]*)\}\s*from/g)].flatMap(match =>
         match[1].split(',').map(part => part.trim().split(/\s+as\s+/).pop())
       )
     ])

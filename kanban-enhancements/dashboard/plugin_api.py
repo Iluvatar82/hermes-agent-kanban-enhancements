@@ -44,7 +44,7 @@ def _same_file(left: str, right: str) -> bool:
 #: not a read of plugin.yaml, because an update swaps that file while this
 #: module stays loaded and the difference is what "restart required" means.
 #: tests/test_manifest.py keeps it equal to the manifest.
-_PLUGIN_VERSION = "0.5.0"
+_PLUGIN_VERSION = "0.5.1"
 
 
 def _package():
