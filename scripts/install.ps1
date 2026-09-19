@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Install this plugin from a local clone into one or more Hermes profiles.
 
@@ -21,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 
 $source = Join-Path (Split-Path -Parent $PSScriptRoot) 'kanban-enhancements'
 if (-not (Test-Path (Join-Path $source 'plugin.yaml'))) {
-    throw "plugin.yaml not found in $source — run this from the repository clone."
+    throw "plugin.yaml not found in $source - run this from the repository clone."
 }
 if (-not (Test-Path $HermesRoot)) {
     throw "Hermes root not found: $HermesRoot (pass -HermesRoot <path>)"
@@ -55,7 +55,7 @@ foreach ($target in $targets) {
         if ($LASTEXITCODE -eq 0) {
             Write-Host "enabled for profile $($target.Name)" -ForegroundColor Green
         } else {
-            Write-Host "could not enable for profile $($target.Name) — run: hermes $($profileArgs -join ' ') plugins enable kanban-enhancements" -ForegroundColor Yellow
+            Write-Host "could not enable for profile $($target.Name) - run: hermes $($profileArgs -join ' ') plugins enable kanban-enhancements" -ForegroundColor Yellow
         }
     }
 }
