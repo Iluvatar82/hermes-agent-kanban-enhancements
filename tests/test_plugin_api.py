@@ -322,6 +322,19 @@ class _FakeUpdateBody:
         self.kwargs = kwargs
 
 
+class _FakeCreateBody:
+    """Every field Kanban+'s create hands to core, plus the ``triage`` flag it
+    turns the Triage lane into. Narrower than core's real body on purpose: the
+    seam test below is what holds the two together."""
+
+    model_fields = dict.fromkeys(
+        ["title", "body", "assignee", "priority", "workspace_kind", "workspace_path",
+         "parents", "skills", "goal_mode", "model_override", "provider_override", "triage"])
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
 @pytest.fixture
 def fake_core(api, monkeypatch):
     """Core's kanban API, faked: record what Kanban+ delegates to it."""
@@ -331,7 +344,15 @@ def fake_core(api, monkeypatch):
         calls.append({"task_id": task_id, "fields": payload.kwargs, "board": board})
         return {"task": {"id": task_id, **payload.kwargs}}
 
-    fake = types.SimpleNamespace(UpdateTaskBody=_FakeUpdateBody, update_task=update_task)
+    def create_task(payload, board=None):
+        calls.append({"create": payload.kwargs, "board": board})
+        # What core derives on its own: Triage from the flag, else Ready.
+        status = "triage" if payload.kwargs.get("triage") else "ready"
+        return {"task": {"id": "t_new", "status": status, "title": payload.kwargs.get("title")}}
+
+    fake = types.SimpleNamespace(
+        CreateTaskBody=_FakeCreateBody, UpdateTaskBody=_FakeUpdateBody,
+        create_task=create_task, update_task=update_task)
     monkeypatch.setattr(api, "_core_kanban_api", lambda: fake)
     return calls
 
@@ -434,6 +455,102 @@ def test_the_patch_fields_are_the_fields_cores_kanban_api_accepts(api):
     assert core is not None, "core's kanban plugin API could not be loaded"
     assert set(api.TaskPatchBody.model_fields) <= set(core.UpdateTaskBody.model_fields)
     assert callable(core.update_task)
+
+
+# --- Adding a task to a lane ------------------------------------------------
+
+
+_NEW = {"title": "Ship it", "body": "Do the thing", "priority": 3}
+
+
+def _post_task(client, **extra):
+    return client.post("/api/plugins/kanban-enhancements/tasks", json={**_NEW, **extra})
+
+
+def test_create_delegates_to_core_and_then_moves_into_the_lane(client, fake_core):
+    """Core derives Ready; landing in the lane that was clicked is the move."""
+    answer = _post_task(client, status="todo")
+
+    assert answer.status_code == 200
+    created, moved = fake_core
+    # `status` is this plugin's field, not core's — it must not be forwarded.
+    assert "status" not in created["create"]
+    assert created["create"]["title"] == "Ship it" and created["create"]["priority"] == 3
+    assert moved == {"task_id": "t_new", "fields": {"status": "todo"}, "board": None}
+    assert answer.json()["task"]["status"] == "todo"
+
+
+def test_create_reaches_the_picked_board_on_both_calls(client, fake_core, boards):
+    """Separate boards, separate DBs — a create and its move must not split."""
+    client.post("/api/plugins/kanban-enhancements/tasks?board=shipping",
+                json={**_NEW, "status": "todo"})
+
+    assert [call["board"] for call in fake_core] == ["shipping", "shipping"]
+
+
+def test_create_in_triage_is_a_flag_core_reads_and_not_a_move(client, fake_core):
+    answer = _post_task(client, status="triage")
+
+    assert answer.status_code == 200
+    assert fake_core == [{"create": {**_NEW, "triage": True}, "board": None}]
+    assert answer.json()["task"]["status"] == "triage"
+
+
+def test_create_in_ready_is_the_status_core_already_gave_it(client, fake_core):
+    answer = _post_task(client, status="ready")
+
+    assert answer.status_code == 200 and len(fake_core) == 1  # no move
+    assert answer.json()["task"]["status"] == "ready"
+
+
+def test_create_refuses_a_lane_the_dispatcher_hands_out(client, fake_core):
+    """Refused HERE, not after the fact: creating the task and then failing to
+    move it would leave a card in a lane nobody asked for."""
+    for lane in ("running", "review", "scheduled"):
+        answer = _post_task(client, status=lane)
+        assert answer.status_code == 400, lane
+
+    assert fake_core == []
+
+
+def test_create_keeps_the_task_when_the_lane_refuses_the_move(client, api, fake_core, monkeypatch):
+    core = api._core_kanban_api()
+
+    def refuse(task_id, payload, board=None):
+        raise fastapi.HTTPException(status_code=409, detail="blocked needs a reason")
+
+    monkeypatch.setattr(core, "update_task", refuse)
+    answer = _post_task(client, status="blocked")
+
+    # The task exists; losing it over a refused move would be the worse answer.
+    assert answer.status_code == 200
+    body = answer.json()
+    assert body["task"]["status"] == "ready"
+    assert "blocked needs a reason" in body["warning"]
+
+
+def test_create_needs_a_title(client, fake_core):
+    assert client.post("/api/plugins/kanban-enhancements/tasks", json={"title": ""}).status_code == 422
+    assert client.post("/api/plugins/kanban-enhancements/tasks", json={}).status_code == 422
+    # A whitespace-only title goes through: core refuses it for every surface,
+    # and one rule in one place beats the same rule in two.
+    assert client.post("/api/plugins/kanban-enhancements/tasks", json={"title": "  "}).status_code == 200
+    assert fake_core[0]["create"]["title"] == "  "
+
+
+def test_create_says_so_when_cores_kanban_api_is_out_of_reach(client, api, monkeypatch):
+    monkeypatch.setattr(api, "_core_kanban_api", lambda: None)
+
+    assert _post_task(client, status="todo").status_code == 503
+
+
+def test_the_create_fields_are_the_fields_cores_kanban_api_accepts(api):
+    """The other half of the delegation seam, against the real checkout."""
+    core = api._core_kanban_api()
+    assert core is not None, "core's kanban plugin API could not be loaded"
+    ours = set(api.TaskCreateBody.model_fields) - {"status"}  # ours alone: the lane
+    assert ours | {"triage"} <= set(core.CreateTaskBody.model_fields)
+    assert callable(core.create_task)
 
 
 def test_the_task_fields_the_detail_view_reads_still_exist(pkg):

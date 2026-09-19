@@ -448,6 +448,94 @@ describe('shortId', () => {
   })
 })
 
+describe('parseSkills', () => {
+  it('splits on commas and drops the empties', () => {
+    assert.deepEqual(plugin.parseSkills(' python , , review '), ['python', 'review'])
+    assert.deepEqual(plugin.parseSkills(''), [])
+    assert.deepEqual(plugin.parseSkills(null), [])
+  })
+})
+
+describe('newTaskPayload', () => {
+  const form = {
+    assignee: '__inherit__',
+    body: '',
+    goalMode: false,
+    model: { model: '', provider: '' },
+    parent: '',
+    priority: '0',
+    skills: '',
+    title: '  Ship it  ',
+    workspaceKind: '__inherit__',
+    workspacePath: ''
+  }
+
+  it('sends the lane, the trimmed title and nothing it was not given', () => {
+    // An empty field sent as '' is not the same as an omitted one: core reads
+    // the first as "no, really, nothing" where it would otherwise inherit the
+    // board's default.
+    assert.deepEqual(plugin.newTaskPayload(form, 'todo'), { priority: 0, status: 'todo', title: 'Ship it' })
+  })
+
+  it('carries every field the dialog did get', () => {
+    assert.deepEqual(
+      plugin.newTaskPayload(
+        {
+          ...form,
+          assignee: 'dev_developer',
+          body: '  context  ',
+          goalMode: true,
+          model: { model: 'qwen3', provider: 'lmstudio' },
+          parent: 't_parent',
+          priority: '7',
+          skills: 'python, review',
+          workspaceKind: 'worktree',
+          workspacePath: ' /repo '
+        },
+        'ready'
+      ),
+      {
+        assignee: 'dev_developer',
+        body: 'context',
+        goal_mode: true,
+        model_override: 'qwen3',
+        parents: ['t_parent'],
+        priority: 7,
+        provider_override: 'lmstudio',
+        skills: ['python', 'review'],
+        status: 'ready',
+        title: 'Ship it',
+        workspace_kind: 'worktree',
+        workspace_path: '/repo'
+      }
+    )
+  })
+
+  it('leaves the assignee out entirely when none was picked', () => {
+    // Omitted, not empty: the dispatcher fills an unassigned ready task from
+    // `kanban.default_assignee` on its next tick, and an empty string would
+    // read as an answer where none was given.
+    assert.ok(!('assignee' in plugin.newTaskPayload(form, 'ready')))
+  })
+
+  it('drops a workspace path that scratch would ignore', () => {
+    const payload = plugin.newTaskPayload({ ...form, workspaceKind: 'scratch', workspacePath: '/repo' }, 'ready')
+
+    assert.equal(payload.workspace_kind, 'scratch')
+    assert.ok(!('workspace_path' in payload))
+  })
+
+  it('never sends a provider without the model it belongs to', () => {
+    const payload = plugin.newTaskPayload({ ...form, model: { model: '', provider: 'lmstudio' } }, 'ready')
+
+    assert.ok(!('provider_override' in payload) && !('model_override' in payload))
+  })
+
+  it('survives a priority that is not a number', () => {
+    assert.equal(plugin.newTaskPayload({ ...form, priority: 'abc' }, 'ready').priority, 0)
+  })
+})
+
 describe('logTail', () => {
   const log = ['one', 'two', 'three', 'four'].join('\n')
 

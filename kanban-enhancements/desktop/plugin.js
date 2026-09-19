@@ -7,10 +7,10 @@
  * jsx()/jsxs()/Fragment, exactly what a compiler would have emitted.
  *
  * What it adds on top of core Kanban:
- *   · a `/kanban-plus` page — the board switcher, the lanes with drag & drop
- *     and a card menu, board stop/start, a parallel-run cap, a board-wide
- *     model, and a task view (core's drawer, plus a worker context meter and a
- *     worker log that can take over the page)
+ *   · a `/kanban-plus` page — the board switcher, the lanes with drag & drop,
+ *     a card menu and a per-lane add, board stop/start, a parallel-run cap, a
+ *     board-wide model, and a task view (core's drawer, plus a worker context
+ *     meter and a worker log that can take over the page)
  *   · a statusbar pill with a small stop/start menu
  *   · three command-palette rows
  *   · a 3px context-fill strip above the composer
@@ -224,6 +224,7 @@ const boardKey = slug => ['kanban-plus', 'board', slug]
 const TASK_KEY = ['kanban-plus', 'task']
 const logKey = (slug, id, view) => ['kanban-plus', 'log', slug, id, view]
 const contextKey = (slug, id) => ['kanban-plus', 'context', slug, id]
+const assigneesKey = slug => ['kanban-plus', 'assignees', slug]
 const taskKey = (slug, id) => ['kanban-plus', 'task', slug, id]
 
 const fetchState = () => api(withBoard('/state'))
@@ -252,6 +253,8 @@ const patchTask = (id, patch) =>
   api(withBoard(`/tasks/${encodeURIComponent(id)}`), { method: 'PATCH', body: patch })
 const postComment = (id, body) =>
   api(withBoard(`/tasks/${encodeURIComponent(id)}/comments`), { method: 'POST', body: { author: 'desktop', body } })
+const fetchAssignees = () => api(withBoard('/assignees'))
+const createTask = body => api(withBoard('/tasks'), { method: 'POST', body })
 
 // The board directory itself. `ctx.rest` cannot leave this plugin's namespace,
 // so these mirror core's own `/boards` endpoints rather than borrowing them.
@@ -2472,6 +2475,353 @@ function useTaskMove() {
   })
 }
 
+// ── adding a task to a lane ──────────────────────────────────────────────────
+// Core's per-lane add, ported: the dashed `+` at the foot of a lane opens the
+// same dialog with that lane as its target. Creating is delegated to core's
+// kanban API (see the backend's `POST /tasks`), so the defaults, the
+// validation and the dispatcher-presence warning are the ones every other
+// surface gets — this page only decides which lane the card lands in.
+
+/** Workspace kinds core's create accepts, in core's order. */
+const WORKSPACE_KINDS = ['scratch', 'worktree', 'dir']
+
+/** `Select` cannot hold an empty value, so "inherit" and "none" need names. */
+const INHERIT = '__inherit__'
+const NO_PARENT = '__none__'
+
+/** Comma-separated skills, trimmed, empties dropped: `a, ,b ` → `['a','b']`. */
+export function parseSkills(text) {
+  return String(text ?? '')
+    .split(',')
+    .map(skill => skill.trim())
+    .filter(Boolean)
+}
+
+/**
+ * The payload the dialog posts. Pure, so what the backend is asked for is
+ * assertable without a dialog: every empty field is LEFT OUT rather than sent
+ * as `''`, because the backend hands what it gets to core, and core reads a
+ * present-but-empty field as "no, really, nothing" where it would otherwise
+ * inherit the board's default.
+ */
+export function newTaskPayload(form, status) {
+  const body = { priority: Number(form.priority) || 0, title: String(form.title ?? '').trim() }
+  const description = String(form.body ?? '').trim()
+  const skills = parseSkills(form.skills)
+  const path = String(form.workspacePath ?? '').trim()
+
+  if (status) {
+    body.status = status
+  }
+
+  if (description) {
+    body.body = description
+  }
+
+  // No assignee at all, rather than an empty one: the dispatcher fills an
+  // unassigned ready task from `kanban.default_assignee` on its next tick, and
+  // that fallback stays live in a way a name resolved here would not.
+  if (form.assignee && form.assignee !== INHERIT) {
+    body.assignee = form.assignee
+  }
+
+  if (form.workspaceKind && form.workspaceKind !== INHERIT) {
+    body.workspace_kind = form.workspaceKind
+  }
+
+  if (path && form.workspaceKind !== 'scratch') {
+    body.workspace_path = path
+  }
+
+  if (skills.length) {
+    body.skills = skills
+  }
+
+  if (form.parent) {
+    body.parents = [form.parent]
+  }
+
+  if (form.goalMode) {
+    body.goal_mode = true
+  }
+
+  if (form.model?.model) {
+    body.model_override = form.model.model
+
+    if (form.model.provider) {
+      body.provider_override = form.model.provider
+    }
+  }
+
+  return body
+}
+
+/** `ModelPicker` reads `current.model` — it wants the pair, never a null. */
+const EMPTY_MODEL = { model: '', provider: '' }
+
+const EMPTY_FORM = {
+  assignee: INHERIT,
+  body: '',
+  goalMode: false,
+  model: EMPTY_MODEL,
+  parent: '',
+  priority: '0',
+  skills: '',
+  title: '',
+  workspaceKind: INHERIT,
+  workspacePath: ''
+}
+
+/** The dialog's scrolling body, inline for the reason in the file header: a
+ *  height Tailwind would have to generate for us is a height we do not get, and
+ *  without one a long form pushes its own footer off the screen. */
+const NEW_TASK_BODY_STYLE = { maxHeight: '60vh' }
+
+/** A labelled field in the dialog — the label style the board dialogs use. */
+function DialogField({ children, hint, label }) {
+  return jsxs('label', {
+    className: 'flex min-w-0 flex-col gap-1',
+    children: [
+      jsx('span', { className: FIELD_LABEL, children: label }),
+      children,
+      hint ? jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: hint }) : null
+    ]
+  })
+}
+
+/** The roster core's picker offers: profiles on disk ∪ this board's assignees. */
+function useAssignees(enabled) {
+  const slug = useValue($boardSlug)
+
+  return useQuery({
+    enabled,
+    queryFn: fetchAssignees,
+    queryKey: assigneesKey(slug),
+    staleTime: 30_000
+  })
+}
+
+/**
+ * The dialog itself. `target` is both the lane the task lands in and the open
+ * flag: a lane means open, `null` means closed, and every field resets on the
+ * way in so the next add never inherits the last one's answers.
+ */
+function NewTaskDialog({ onClose, parents, target }) {
+  const qc = useQueryClient()
+  const [form, setForm] = useState(EMPTY_FORM)
+  const [error, setError] = useState(null)
+  const open = Boolean(target)
+  const { data: roster } = useAssignees(open)
+  const set = (field, value) => setForm(previous => ({ ...previous, [field]: value }))
+
+  useEffect(() => {
+    if (open) {
+      setForm(EMPTY_FORM)
+      setError(null)
+    }
+  }, [open])
+
+  const create = useMutation({
+    mutationFn: () => createTask(newTaskPayload(form, target)),
+    onError: err => setError(errText(err)),
+    onSuccess: result => {
+      // The backend warns rather than fails when the new task would sit idle
+      // (no dispatcher) or when the move into the lane was refused — both are
+      // things to say out loud, neither is a reason to keep the dialog open.
+      if (result?.warning) {
+        host.notify({ kind: 'warning', message: result.warning })
+      } else {
+        host.notify({ kind: 'info', message: `Angelegt in ${columnMeta(target).label}` })
+      }
+
+      refreshAll(qc)
+      onClose()
+    }
+  })
+
+  const title = form.title.trim()
+  const submit = () => title && !create.isPending && create.mutate()
+
+  return jsx(Dialog, {
+    onOpenChange: next => !next && onClose(),
+    open,
+    children: jsxs(DialogContent, {
+      className: 'max-w-lg',
+      children: [
+        jsx(DialogHeader, {
+          children: jsx(DialogTitle, {
+            children: target ? `Neue Aufgabe in ${columnMeta(target).label}` : 'Neue Aufgabe'
+          })
+        }),
+        jsxs('div', {
+          className: 'flex flex-col gap-3 overflow-y-auto pr-0.5',
+          style: NEW_TASK_BODY_STYLE,
+          children: [
+            jsx(DialogField, {
+              label: 'Titel',
+              children: jsx(Input, {
+                autoFocus: true,
+                onChange: event => set('title', event.target.value),
+                onKeyDown: event => isSubmitEnter(event) && submit(),
+                placeholder: 'Was soll getan werden?',
+                value: form.title
+              })
+            }),
+            jsx(DialogField, {
+              label: 'Beschreibung',
+              children: jsx(PlainTextarea, {
+                onChange: event => set('body', event.target.value),
+                placeholder: 'Kontext, Akzeptanzkriterien, Links …',
+                rows: 4,
+                value: form.body
+              })
+            }),
+            jsxs('div', {
+              className: 'grid grid-cols-2 gap-3',
+              children: [
+                jsx(DialogField, {
+                  label: 'Priorität',
+                  children: jsx(Input, {
+                    onChange: event => set('priority', event.target.value),
+                    type: 'number',
+                    value: form.priority
+                  })
+                }),
+                jsx(DialogField, {
+                  label: 'Workspace',
+                  children: jsxs(Select, {
+                    onValueChange: value => set('workspaceKind', value),
+                    value: form.workspaceKind,
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                      jsxs(SelectContent, {
+                        children: [
+                          jsx(SelectItem, { value: INHERIT, children: 'Board-Vorgabe' }),
+                          WORKSPACE_KINDS.map(kind => jsx(SelectItem, { value: kind, children: kind }, kind))
+                        ]
+                      })
+                    ]
+                  })
+                })
+              ]
+            }),
+            form.workspaceKind === 'worktree' || form.workspaceKind === 'dir'
+              ? jsx(DialogField, {
+                  hint: 'Leer = das Arbeitsverzeichnis des Boards.',
+                  label: 'Workspace-Pfad',
+                  children: jsx(Input, {
+                    onChange: event => set('workspacePath', event.target.value),
+                    placeholder: 'Pfad zum Repo oder Verzeichnis',
+                    value: form.workspacePath
+                  })
+                })
+              : null,
+            jsx(DialogField, {
+              hint: 'Ohne Auswahl vergibt der Dispatcher `kanban.default_assignee`.',
+              label: 'Worker',
+              children: jsxs(Select, {
+                onValueChange: value => set('assignee', value),
+                value: form.assignee,
+                children: [
+                  jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                  jsxs(SelectContent, {
+                    children: [
+                      jsx(SelectItem, { value: INHERIT, children: 'Dispatcher-Vorgabe' }),
+                      (roster?.assignees ?? []).map(entry =>
+                        jsx(SelectItem, { value: entry.name, children: entry.name }, entry.name)
+                      )
+                    ]
+                  })
+                ]
+              })
+            }),
+            jsx(DialogField, {
+              hint: 'Komma-getrennt, z. B. `python, review`.',
+              label: 'Skills',
+              children: jsx(Input, {
+                onChange: event => set('skills', event.target.value),
+                placeholder: 'optional',
+                value: form.skills
+              })
+            }),
+            jsx(DialogField, {
+              label: 'Modell',
+              children: jsxs('div', {
+                className: 'flex min-w-0 items-center gap-1',
+                children: [
+                  jsx(ModelPicker, {
+                    ariaLabel: 'Modell für diesen Task',
+                    current: form.model,
+                    inheritCopy: MODEL_INHERIT,
+                    onPick: (model, provider) => set('model', { model, provider }),
+                    triggerClassName: 'min-w-0 flex-1'
+                  }),
+                  jsx(ClearModelButton, {
+                    label: 'Modell zurücksetzen',
+                    onClear: () => set('model', EMPTY_MODEL),
+                    shown: Boolean(String(form.model.model).trim())
+                  })
+                ]
+              })
+            }),
+            parents.length > 0
+              ? jsx(DialogField, {
+                  hint: 'Der Task bleibt in Todo, bis der übergeordnete fertig ist.',
+                  label: 'Hängt ab von',
+                  children: jsxs(Select, {
+                    onValueChange: value => set('parent', value === NO_PARENT ? '' : value),
+                    value: form.parent || NO_PARENT,
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                      jsxs(SelectContent, {
+                        children: [
+                          jsx(SelectItem, { value: NO_PARENT, children: 'Nichts' }),
+                          parents.map(option =>
+                            jsx(SelectItem, { value: option.id, children: option.title || option.id }, option.id)
+                          )
+                        ]
+                      })
+                    ]
+                  })
+                })
+              : null,
+            // A codicon toggle, not the SDK's `Switch` and not a bare
+            // checkbox: one named import this plugin cannot count on across
+            // Hermes versions fails the whole file at load, and a raw checkbox
+            // has no rule of Hermes' to borrow (the app only ships `Switch`),
+            // so it would render as the browser's.
+            jsxs('button', {
+              'aria-checked': form.goalMode,
+              className: cn(
+                'flex w-fit cursor-pointer items-center gap-2 rounded-md py-1 text-[0.75rem] transition-colors',
+                form.goalMode ? 'text-foreground' : 'text-(--ui-text-tertiary) hover:text-(--ui-text-secondary)'
+              ),
+              onClick: () => set('goalMode', !form.goalMode),
+              role: 'switch',
+              type: 'button',
+              children: [
+                jsx(Codicon, { name: form.goalMode ? 'pass' : 'circle-outline', size: '0.85rem' }),
+                'Ziel-Modus (der Worker prüft sein Ergebnis selbst)'
+              ]
+            }),
+            error ? jsx('span', { className: 'text-[0.75rem] text-destructive', children: error }) : null
+          ]
+        }),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { onClick: onClose, variant: 'text', children: 'Abbrechen' }),
+            jsx(Button, {
+              disabled: !title || create.isPending,
+              onClick: submit,
+              children: create.isPending ? 'Wird angelegt …' : 'Aufgabe anlegen'
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
 // ── the card's right-click menu ──────────────────────────────────────────────
 // Hand-rolled on purpose: the SDK's ContextMenu is not part of the export
 // surface this plugin can count on across the Hermes versions it must keep
@@ -2702,7 +3052,7 @@ function BoardCard({ columns, now, onMove, onSelect, selected, task }) {
 const RAIL_STYLE = { width: '2.25rem' }
 const RAIL_LABEL_STYLE = { writingMode: 'vertical-rl' }
 
-function BoardColumn({ collapsed, column, columns, now, onMove, onSelect, onToggle, selectedId }) {
+function BoardColumn({ collapsed, column, columns, now, onAdd, onMove, onSelect, onToggle, selectedId }) {
   const [over, setOver] = useState(false)
   const meta = columnMeta(column.name)
   const locked = isLockedTarget(column.name)
@@ -2830,14 +3180,31 @@ function BoardColumn({ collapsed, column, columns, now, onMove, onSelect, onTogg
           })
         ]
       }),
-      jsx('div', {
+      jsxs('div', {
         className: 'flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto pb-2',
-        children:
+        children: [
           tasks.length === 0
             ? jsx('span', { className: 'px-0.5 text-[0.6875rem] text-(--ui-text-quaternary)', children: '—' })
             : tasks.map(task =>
                 jsx(BoardCard, { columns, now, onMove, onSelect, selected: task.id === selectedId, task }, task.id)
-              )
+              ),
+          // Core's Jira-style lane add, at the foot of the cards. A locked lane
+          // gets none: the dispatcher hands those out, and an add that cannot
+          // land is worse than no button. Always drawn rather than revealed on
+          // hover — the same call this file makes for the fold chevron: a
+          // control you need should not be a control you have to find.
+          locked
+            ? null
+            : jsx('button', {
+                'aria-label': `Neue Aufgabe in ${meta.label}`,
+                className:
+                  'flex shrink-0 cursor-pointer items-center justify-center gap-1 rounded-md border border-dashed border-(--ui-stroke-tertiary) py-1.5 text-[0.6875rem] text-(--ui-text-quaternary) transition-colors hover:border-(--ui-stroke-secondary) hover:bg-(--chrome-action-hover) hover:text-foreground',
+                onClick: () => onAdd(column.name),
+                title: `Neue Aufgabe in ${meta.label}`,
+                type: 'button',
+                children: [jsx(Codicon, { name: 'add', size: '0.75rem' }), 'Aufgabe']
+              })
+        ]
       })
     ]
   })
@@ -2846,7 +3213,7 @@ function BoardColumn({ collapsed, column, columns, now, onMove, onSelect, onTogg
 /** The whole board, one lane per status, scrolling sideways when it is wider
  *  than the page. The page owns the query — it needs the same cards to resolve
  *  a selection the drawer opens on. */
-function BoardColumns({ board, error, isLoading, now, onMove, onSelect, selectedId }) {
+function BoardColumns({ board, error, isLoading, now, onAdd, onMove, onSelect, selectedId }) {
   const columns = board?.columns ?? []
   const names = useMemo(() => columns.map(column => column.name), [columns])
   const overrides = useValue($collapsedLanes)
@@ -2879,9 +3246,19 @@ function BoardColumns({ board, error, isLoading, now, onMove, onSelect, selected
   if (columns.every(column => (column.tasks?.length ?? 0) === 0)) {
     return jsx('div', {
       className: 'grid h-full place-items-center p-4',
-      children: jsx(EmptyState, {
-        description: 'Dieses Board hat noch keine Tasks. Lege einen an — auf der Kanban-Seite oder mit `hermes kanban add`.',
-        title: 'Leeres Board'
+      children: jsxs('div', {
+        className: 'flex flex-col items-center gap-3',
+        children: [
+          jsx(EmptyState, {
+            description: 'Dieses Board hat noch keine Tasks.',
+            title: 'Leeres Board'
+          }),
+          jsxs(Button, {
+            onClick: () => onAdd('ready'),
+            size: 'sm',
+            children: [jsx(Codicon, { name: 'add', size: '0.8rem' }), 'Erste Aufgabe anlegen']
+          })
+        ]
       })
     })
   }
@@ -2897,6 +3274,7 @@ function BoardColumns({ board, error, isLoading, now, onMove, onSelect, selected
           column,
           columns: names,
           now,
+          onAdd,
           onMove,
           onSelect,
           onToggle: () =>
@@ -3567,11 +3945,17 @@ function KanbanPlusPage() {
   // The worker log, blown up over the whole page. Off by default; Esc and the
   // same four-arrow button both put the task's details back.
   const [logExpanded, setLogExpanded] = useState(false)
+  // The lane a `+` was clicked in — the new-task dialog's target AND its open
+  // flag, so there is no second piece of state to keep in step with it.
+  const [addLane, setAddLane] = useState(null)
   const move = useTaskMove()
 
   // A task id belongs to the board it came from, so a switch re-reads THAT
   // board's remembered selection instead of pointing at a task it never had.
-  useEffect(() => setSelectedId(readSelectedTask(slug)), [slug])
+  useEffect(() => {
+    setSelectedId(readSelectedTask(slug))
+    setAddLane(null)
+  }, [slug])
 
   const {
     data: state,
@@ -3601,6 +3985,15 @@ function KanbanPlusPage() {
 
   const running = useMemo(() => tasks?.running ?? [], [tasks])
   const recent = useMemo(() => tasks?.recent ?? [], [tasks])
+  // Every card on the board is a candidate parent for a new task, the way
+  // core's create dialog offers them.
+  const parentOptions = useMemo(
+    () =>
+      (board?.columns ?? [])
+        .flatMap(column => column.tasks ?? [])
+        .map(task => ({ id: task.id, title: task.title })),
+    [board]
+  )
   const columnNames = useMemo(() => {
     const names = (board?.columns ?? []).map(column => column.name)
 
@@ -3748,6 +4141,7 @@ function KanbanPlusPage() {
               error: boardError,
               isLoading: boardLoading,
               now,
+              onAdd: setAddLane,
               onMove: (id, status) => move.mutate({ id, status }),
               onSelect: select,
               selectedId
@@ -3770,6 +4164,7 @@ function KanbanPlusPage() {
             : null
         ]
       }),
+      jsx(NewTaskDialog, { onClose: () => setAddLane(null), parents: parentOptions, target: addLane }),
       logExpanded && (selected || selectedId)
         ? jsx(LogOverlay, {
             onClose: () => setLogExpanded(false),
