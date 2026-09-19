@@ -1,10 +1,16 @@
 name: kanban-enhancements
-version: 0.2.0
+version: 0.2.1
 description: "Operator controls for the Hermes kanban board: stop/start the whole board, a live cap on parallel runs, per-line worker-log timestamps, worker context-window snapshots, and a desktop page that shows all of it."
 author: "Franz Spitaler"
 license: MIT
 homepage: "https://github.com/Iluvatar82/hermes-agent-kanban-enhancements"
-manifest_version: 2
+# No manifest_version on purpose. Every field in this file is parsed by the plugin LOADER
+# regardless of the declared version (plugins_manifest.SUPPORTED_MANIFEST_VERSION is 2 and
+# config_schema, license, homepage and tags are read unconditionally), but the INSTALLER in
+# Hermes 0.21.x still caps at 1 — declaring 2 made `hermes plugins install` and the desktop's
+# "Install from Git" refuse the plugin outright ("requires manifest_version 2, but this
+# installer only supports up to 1"), leaving scripts/install.ps1 as the only way in.
+# Re-declare it once the installer catches up; tests/test_manifest.py guards the gap.
 requires_hermes: ">=0.21"
 tags:
   - kanban

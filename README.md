@@ -139,14 +139,15 @@ If you hit that, please open an issue with your Hermes version.
 ```bash
 git clone https://github.com/Iluvatar82/hermes-agent-kanban-enhancements
 cd hermes-agent-kanban-enhancements
-HERMES_AGENT_REPO=/path/to/hermes-agent pytest    # 47 tests against a real checkout
+HERMES_AGENT_REPO=/path/to/hermes-agent pytest    # 52 tests against a real checkout
 node --test tests/desktop/*.test.mjs              # the desktop helpers, with stubbed SDK
 ruff check .
 ```
 
 The Python tests import the plugin exactly the way Hermes does and exercise the seams against a
 real Hermes checkout rather than a stub; without `HERMES_AGENT_REPO` (or a checkout in the default
-location) they skip.
+location) they skip. `tests/test_manifest.py` checks `plugin.yaml` against that checkout's own
+installer and loader — a manifest the installed Hermes refuses is a plugin nobody can install.
 
 ```
 kanban-enhancements/      the installable package (this is what lands in $HERMES_HOME/plugins/)
