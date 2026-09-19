@@ -88,6 +88,32 @@ def test_state_reports_board_and_cap(client, pkg, board_root, monkeypatch):
     assert body["model"] == "" and "guard_active" in body and "model_patches" in body
 
 
+def test_state_repairs_the_patches_before_reporting(client, pkg, board_root, monkeypatch):
+    """Opening the page is the fix, not just the diagnosis: a patch an early
+    import failure cost us is re-installed before ``/state`` describes it."""
+    kbd = pkg.core.kanban_dispatch()
+    monkeypatch.setattr(kbd, "dispatch_once", _recording_dispatch(kbd))
+    monkeypatch.setattr(kbd, "_default_spawn", lambda task, workspace, *, board=None: 1)
+    pkg.dispatch_guard.uninstall()
+    pkg.board_model.uninstall()
+    assert pkg.dispatch_guard.is_installed() is False
+
+    body = client.get("/api/plugins/kanban-enhancements/state").json()
+    assert body["guard_active"] is True
+    assert body["model_patches"]["spawn"] is True
+    assert pkg.dispatch_guard.is_installed() is True
+
+
+def _recording_dispatch(kbd):
+    """A stand-in carrying core's real keyword signature (the guard checks it)."""
+
+    def dispatch_once(conn, *, spawn_fn=None, ttl_seconds=None, dry_run=False, max_spawn=None,
+                      max_in_progress=None, board=None, **rest):
+        return kbd.DispatchResult()
+
+    return dispatch_once
+
+
 def test_stop_and_start_roundtrip(client, pkg, board_root, monkeypatch):
     kb = pkg.core.kanban_db()
     monkeypatch.setattr(kb, "reclaim_task", lambda *a, **k: True)

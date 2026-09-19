@@ -31,7 +31,7 @@ from . import core
 #: manual copy, or scripts/install.ps1.
 DEFAULT_SOURCE = "https://github.com/Iluvatar82/hermes-agent-kanban-enhancements.git#kanban-enhancements"
 
-#: `version: 0.3.0`, optionally quoted, at the start of a line in plugin.yaml.
+#: `version: 0.4.0`, optionally quoted, at the start of a line in plugin.yaml.
 _VERSION_RE = re.compile(r"^version:\s*['\"]?([^'\"\s#]+)", re.MULTILINE)
 
 #: `--ref` takes nothing but a full commit SHA, and neither do we.

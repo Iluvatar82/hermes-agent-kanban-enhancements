@@ -158,3 +158,66 @@ def test_guard_refuses_an_unknown_dispatch_signature(pkg, guard, monkeypatch, ca
     monkeypatch.setattr(kbd, "dispatch_once", lambda conn: None)  # no board/max_in_progress kwargs
     assert guard.install() is False
     assert guard.is_installed() is False
+
+
+def test_guard_install_is_idempotent_and_retryable(pkg, board_root, guard, monkeypatch):
+    """The flag lives on the patched function, so a second install is a no-op
+    and a first one that came too early can simply be repeated."""
+    kbd = pkg.core.kanban_dispatch()
+    monkeypatch.setattr(kbd, "dispatch_once", _recording_dispatch(kbd, []))
+
+    assert guard.install() is True
+    wrapper = kbd.dispatch_once
+    assert guard.install() is True
+    assert kbd.dispatch_once is wrapper, "a second install must not wrap the wrapper"
+
+
+def test_guard_state_is_read_off_the_dispatcher(pkg, board_root, guard, monkeypatch):
+    """Not off a module global: a gateway can hold several copies of this
+    package, and only the dispatcher itself knows what is actually installed."""
+    kbd = pkg.core.kanban_dispatch()
+    monkeypatch.setattr(kbd, "dispatch_once", _recording_dispatch(kbd, []))
+    guard.install()
+    assert guard.is_installed() is True
+
+    # Something else replaced the dispatcher behind our back.
+    monkeypatch.setattr(kbd, "dispatch_once", _recording_dispatch(kbd, []))
+    assert guard.is_installed() is False, "a patch that is gone must not report itself as live"
+    assert guard.install() is True, "and asking again must put it back"
+
+
+def test_guard_uninstall_leaves_a_foreign_dispatch_alone(pkg, board_root, guard, monkeypatch):
+    kbd = pkg.core.kanban_dispatch()
+    foreign = _recording_dispatch(kbd, [])
+    monkeypatch.setattr(kbd, "dispatch_once", foreign)
+
+    guard.uninstall()
+    assert kbd.dispatch_once is foreign
+
+
+def test_a_second_copy_of_the_package_adopts_the_first_ones_patch(
+        pkg, board_root, guard, monkeypatch, plugin_dir):
+    """What a multi-profile gateway really does: ``plugins_loader`` gives every
+    Hermes home its own module name, so the same plugin is imported more than
+    once. The second copy must see the guard and leave it alone."""
+    import importlib.util
+    import sys
+
+    kbd = pkg.core.kanban_dispatch()
+    monkeypatch.setattr(kbd, "dispatch_once", _recording_dispatch(kbd, []))
+    guard.install()
+    wrapper = kbd.dispatch_once
+
+    name = "kanban_enhancements_second_copy"
+    spec = importlib.util.spec_from_file_location(
+        name, plugin_dir / "__init__.py", submodule_search_locations=[str(plugin_dir)])
+    second = importlib.util.module_from_spec(spec)
+    sys.modules[name] = second
+    try:
+        spec.loader.exec_module(second)
+        assert second.dispatch_guard.is_installed() is True
+        assert second.dispatch_guard.install() is True
+        assert kbd.dispatch_once is wrapper
+    finally:
+        for key in [key for key in sys.modules if key == name or key.startswith(f"{name}.")]:
+            del sys.modules[key]

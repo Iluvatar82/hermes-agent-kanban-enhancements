@@ -29,8 +29,8 @@ from . import (
 )
 from .core import logger
 
-__all__ = ["register", "board_control", "board_model", "dispatch_guard", "log_stamps", "self_update",
-           "worker_context"]
+__all__ = ["register", "ensure_patches", "board_control", "board_model", "dispatch_guard",
+           "log_stamps", "self_update", "worker_context"]
 
 _SETTING_KEYS = (
     "stop_terminates_workers",
@@ -53,6 +53,24 @@ def _load_settings(ctx) -> None:
     core.set_settings(values)
 
 
+def ensure_patches() -> dict[str, bool]:
+    """Install every core patch that is not already in place; the state after.
+
+    Idempotent, cheap and safe from any thread or any copy of this package: the
+    flag lives on the patched function, so "already done" is an attribute read
+    and two copies never wrap each other. Called from ``register``, from the
+    dispatch-tick hook, from ``GET /state`` and from the CLI — whoever asks
+    first repairs a patch that an early import failure cost us.
+    """
+    guard = bool(core.guarded("dispatcher guard")(dispatch_guard.install)())
+    return {"guard": guard, **board_model.install()}
+
+
+def _repair_patches(**_kwargs) -> None:
+    """``on_kanban_dispatch_tick`` observer — see :func:`ensure_patches`."""
+    ensure_patches()
+
+
 def register(ctx) -> None:
     """Plugin entry point. Runs in the gateway, in every worker and in the CLI."""
     _load_settings(ctx)
@@ -65,9 +83,15 @@ def register(ctx) -> None:
             "worker log timestamps")(log_stamps.install_worker_streams)():
         logger.debug("worker log timestamps active")
 
-    core.guarded("dispatcher guard")(dispatch_guard.install)()
-    core.guarded("board model (task executions)")(board_model.install_spawn_patch)()
-    core.guarded("board model (auto-composer)")(board_model.install_aux_patch)()
+    ensure_patches()
+
+    # The same three patches, re-checked once per dispatcher tick. Boot is the
+    # worst moment to import the dispatcher and the auxiliary client, and an
+    # import that was not ready then used to leave the guard and the board
+    # model off for the whole life of the process. The tick fires after the
+    # dispatch lock is released, so this costs three attribute reads on a tick
+    # where everything is already in place, and repairs it where it is not.
+    ctx.register_hook("on_kanban_dispatch_tick", _repair_patches)
 
     if core.setting("worker_context_snapshots", True):
         ctx.register_hook("post_llm_call", worker_context.record)

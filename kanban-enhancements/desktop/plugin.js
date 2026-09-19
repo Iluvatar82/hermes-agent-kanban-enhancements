@@ -22,6 +22,17 @@
  * The page renders its own header (switcher included) rather than contributing
  * to `WORKSPACE_PAGE_HEADER_AREA`: that band belongs to the MAIN workspace pane,
  * so a page opened as a split tile never gets it.
+ *
+ * ── A RULE ABOUT CLASS NAMES ────────────────────────────────────────────────
+ * Tailwind v4 generates the app's stylesheet by SCANNING SOURCE AT BUILD TIME,
+ * and a plugin loaded from disk at runtime is not in that scan. So a class only
+ * works here if Hermes' own source happens to contain the same string — every
+ * utility below is one the app already emits. An invented arbitrary value
+ * (`w-96`, `max-w-[55%]`, `min-h-(--x)`, `w-[min(…)]`) produces NO rule at all
+ * and fails silently, which is how the task drawer spent a release with no
+ * width of its own. Anything load-bearing — the drawer's width, the log's
+ * height, the folded lane's rail — therefore goes through an inline `style`,
+ * where nothing has to be generated for it to apply.
  */
 
 import {
@@ -111,6 +122,81 @@ function pluginOs() {
 export const $boardSlug = atom('')
 
 const BOARD_SLUG_KEY = 'boardSlug'
+
+// ── collapsed lanes ──────────────────────────────────────────────────────────
+// Core's Kanban page rule, ported so both boards behave the same: a lane with
+// no cards collapses to a rail, a lane with cards is open, and the map below
+// holds only the DEVIATIONS the reader clicked. Storing overrides rather than
+// states is what keeps "automatic" automatic — an untouched board never grows
+// an entry, and a lane the reader opened stops deviating the moment its
+// emptiness flips, so a drained lane collapses again on its own.
+
+/** Per-lane overrides of the automatic rule (true = collapsed). Persisted. */
+export const $collapsedLanes = atom({})
+
+const COLLAPSED_LANES_KEY = 'collapsedLanes'
+
+/** The automatic state for a lane: empty collapses, occupied opens. */
+export function laneAutoCollapsed(column) {
+  return (column?.tasks?.length ?? 0) === 0
+}
+
+/** Whether a lane renders as a rail: the reader's override, else the rule. */
+export function laneCollapsed(overrides, column) {
+  const auto = laneAutoCollapsed(column)
+
+  return overrides?.[column?.name] ?? auto
+}
+
+/** The override map after a click on `name`, whose automatic state is `auto`.
+ *  Choosing what the rule already says removes the override instead of
+ *  freezing it — one click back to automatic, not two. */
+export function toggleLane(overrides, name, auto) {
+  const next = { ...overrides }
+
+  if (!(next[name] ?? auto)) {
+    next[name] = true
+  } else {
+    next[name] = false
+  }
+
+  if (next[name] === auto) {
+    delete next[name]
+  }
+
+  return next
+}
+
+/** `triage:empty|todo:full|…` — the signature that says which lanes changed
+ *  phase. Comparing two of these is how an override learns it is stale. */
+export function lanePhase(columns) {
+  return (columns ?? []).map(column => `${column.name}:${laneAutoCollapsed(column) ? 'empty' : 'full'}`).join('|')
+}
+
+/** Drop every override whose lane flipped between empty and occupied: that is
+ *  the moment the reader's "no, keep this one open" stops being about the lane
+ *  they opened. Lanes that did not move keep theirs. */
+export function pruneStaleLanes(overrides, previousPhase, phase) {
+  if (!previousPhase || previousPhase === phase) {
+    return overrides
+  }
+
+  const before = new Map(previousPhase.split('|').map(entry => entry.split(':')))
+  const next = { ...overrides }
+  let changed = false
+
+  for (const entry of phase.split('|')) {
+    const [name, state] = entry.split(':')
+    const was = before.get(name)
+
+    if (was !== undefined && was !== state && name in next) {
+      delete next[name]
+      changed = true
+    }
+  }
+
+  return changed ? next : overrides
+}
 
 /** Append the selected board (and any other params) to a path. */
 export function withBoard(path, params = {}) {
@@ -558,6 +644,11 @@ function BreakdownList({ categories, header }) {
   })
 }
 
+/** The context meter's bar, inline for the reason in the file header: a hair
+ *  of a line, and the same value for the cap that marks its leading edge. */
+const METER_HEIGHT = '3px'
+const METER_BAR_STYLE = { height: METER_HEIGHT }
+
 /**
  * A slim horizontal bar split into the snapshot's categories, with the
  * breakdown on hover. Deliberately hand-rolled instead of the SDK's
@@ -618,7 +709,8 @@ function ContextBar({ align = 'end', className, header, showLabel = true, side =
   const label = `${compactNumber(used)}/${compactNumber(max)} (${percent}%)`
 
   const bar = jsxs('div', {
-    className: 'relative flex h-[3px] min-w-8 flex-1 overflow-hidden rounded-full bg-(--ui-stroke-tertiary)',
+    className: 'relative flex min-w-8 flex-1 overflow-hidden rounded-full bg-(--ui-stroke-tertiary)',
+    style: METER_BAR_STYLE,
     children: [
       segments.length > 0
         ? segments.map(segment =>
@@ -634,8 +726,8 @@ function ContextBar({ align = 'end', className, header, showLabel = true, side =
       tone === 'normal'
         ? null
         : jsx('span', {
-            className: 'absolute inset-y-0 w-[3px] rounded-full',
-            style: { background: color, left: `calc(${percent}% - 3px)` }
+            className: 'absolute inset-y-0 rounded-full',
+            style: { background: color, left: `calc(${percent}% - ${METER_HEIGHT})`, width: METER_HEIGHT }
           })
     ]
   })
@@ -781,6 +873,16 @@ export function logTail(content, limit) {
 /** Lines the small log keeps — roughly a screenful and a half of scrollback. */
 const SMALL_LOG_LINES = 300
 
+/** The log band inside the task drawer, inline for the reason in the file
+ *  header. 200px is about a dozen lines — the difference between a glance and a
+ *  peephole — and the cap keeps a long tail from pushing the comments off the
+ *  end of the drawer. The four-arrow button goes full page for the rest. */
+const SMALL_LOG_STYLE = { maxHeight: '20rem', minHeight: '200px' }
+
+/** The full log's line height, inline for the reason in the file header: the
+ *  gutter and the text have to sit on the same baseline grid. */
+const FULL_LOG_STYLE = { lineHeight: 1.6 }
+
 /**
  * The log as a two-column timeline: write time left, text right, day dividers.
  * `compact` drops the gutter and the dividers — the small view has no room for
@@ -806,8 +908,9 @@ function TimestampedLog({ compact = false, content }) {
   }
 
   return jsx('div', {
-    className: 'grid grid-cols-[auto_minmax(0,1fr)] font-mono text-[0.75rem] leading-[1.6] text-(--ui-text-tertiary)',
+    className: 'grid grid-cols-[auto_minmax(0,1fr)] font-mono text-[0.75rem] text-(--ui-text-tertiary)',
     'data-selectable-text': 'true',
+    style: FULL_LOG_STYLE,
     children: rows.map((row, index) =>
       row.kind === 'day'
         ? jsxs(
@@ -940,12 +1043,18 @@ function TaskLogSection({ onExpand, task }) {
       ]
     }),
     label: 'Worker-Log',
+    // A fixed band, not a box that shrinks to its content: the log is the
+    // reason this drawer is open half the time, and three lines of it in a
+    // panel with room for twenty is not worth the glance. Floored at
+    // SMALL_LOG_MIN_HEIGHT and capped so it cannot push the comments off the
+    // end of a long task; the button above it still goes full page.
     children: jsx('div', {
-      className: 'rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-quaternary)/40',
+      className: 'flex flex-col rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-bg-quaternary)/40',
+      style: SMALL_LOG_STYLE,
       children:
         placeholder ??
         jsx(LogScroller, {
-          className: 'max-h-48 overflow-auto px-2 py-1.5',
+          className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-2 py-1.5',
           content: tail,
           children: jsx(TimestampedLog, { compact: true, content: tail })
         })
@@ -963,8 +1072,11 @@ function LogOverlay({ onClose, task }) {
   const meta = logMeta(log)
   const placeholder = jsx(LogPlaceholder, { error, isLoading, log })
 
+  // `inset-0` of the PAGE root (which clips): exactly the space Kanban+ owns,
+  // never the window. Lines wrap rather than scroll sideways, so the only
+  // scrollbar in here is the vertical one.
   return jsxs('div', {
-    className: 'absolute inset-0 z-30 flex flex-col bg-(--ui-surface-background)',
+    className: 'absolute inset-0 z-30 flex flex-col overflow-hidden bg-(--ui-surface-background)',
     'data-slot': 'kanban-plus-log-overlay',
     children: [
       jsxs('header', {
@@ -982,7 +1094,7 @@ function LogOverlay({ onClose, task }) {
             children: task.title || task.id
           }),
           jsx('span', {
-            className: 'shrink-0 font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
+            className: 'min-w-0 truncate font-mono text-[0.6875rem] text-(--ui-text-quaternary)',
             'data-selectable-text': 'true',
             children: task.id
           }),
@@ -1008,7 +1120,7 @@ function LogOverlay({ onClose, task }) {
       placeholder
         ? jsx('div', { className: 'grid min-h-0 flex-1 place-items-center p-6', children: placeholder })
         : jsx(LogScroller, {
-            className: 'min-h-0 flex-1 overflow-auto px-4 py-3',
+            className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-4 py-3',
             content: log?.content,
             children: jsx(TimestampedLog, { content: log?.content ?? '' })
           })
@@ -1525,7 +1637,7 @@ export function updateState(version) {
   return version.update_available ? 'available' : 'current'
 }
 
-/** `Kanban+ 0.3.0`, and what is running when that is not what is installed. */
+/** `Kanban+ 0.4.0`, and what is running when that is not what is installed. */
 export function versionLabel(version) {
   const installed = String(version?.installed ?? '').trim()
   const running = String(version?.running ?? '').trim()
@@ -1764,66 +1876,6 @@ function BoardControls({ state }) {
         },
         open: confirming,
         title: 'Board wirklich stoppen?'
-      })
-    ]
-  })
-}
-
-// ── task list ────────────────────────────────────────────────────────────────
-
-function TaskRow({ now, onSelect, selected, task }) {
-  const running = task.status === 'running'
-  const startedMs = parseMs(task.started_at)
-  const stamp = task.completed_at ?? task.started_at ?? task.created_at
-
-  return jsxs('button', {
-    className: cn(
-      'flex w-full flex-col gap-1 border-l-2 px-3 py-2 text-left transition-colors',
-      selected ? 'border-primary bg-(--ui-bg-quaternary)' : 'border-transparent hover:bg-(--ui-bg-quaternary)/60'
-    ),
-    onClick: () => onSelect(task.id),
-    type: 'button',
-    children: [
-      jsxs('div', {
-        className: 'flex items-center gap-1.5',
-        children: [
-          running
-            ? jsx('span', { className: 'size-1.5 shrink-0 animate-pulse rounded-full bg-primary' })
-            : jsx(StatusDot, { className: 'shrink-0', tone: task.status === 'done' ? 'good' : 'muted' }),
-          jsx('span', {
-            className: 'min-w-0 flex-1 truncate text-[0.75rem] text-foreground',
-            title: task.title,
-            children: task.title
-          }),
-          running && startedMs !== null
-            ? jsx('span', {
-                className: 'shrink-0 text-[0.625rem] tabular-nums text-(--ui-text-tertiary)',
-                children: formatElapsed(startedMs, now)
-              })
-            : null
-        ]
-      }),
-      jsx('div', {
-        className: 'flex items-center gap-1.5 pl-3 text-[0.625rem] text-(--ui-text-quaternary)',
-        children: [task.status, task.assignee, formatStamp(stamp)].filter(Boolean).join(' · ')
-      })
-    ]
-  })
-}
-
-function TaskGroup({ label, now, onSelect, selectedId, tasks }) {
-  if (!tasks.length) {
-    return null
-  }
-
-  return jsxs('div', {
-    children: [
-      jsx('div', {
-        className: 'px-3 pt-3 pb-1 text-[0.625rem] font-medium tracking-wide text-(--ui-text-quaternary) uppercase',
-        children: label
-      }),
-      jsx('div', {
-        children: tasks.map(task => jsx(TaskRow, { now, onSelect, selected: task.id === selectedId, task }, task.id))
       })
     ]
   })
@@ -2561,7 +2613,13 @@ function BoardCard({ columns, now, onMove, onSelect, selected, task }) {
   })
 }
 
-function BoardColumn({ column, columns, now, onMove, onSelect, selectedId }) {
+/** A folded lane, inline for the reason in the file header: wide enough for the
+ *  dot and the sideways label, and no wider — the point is the space it gives
+ *  back to the lanes that have cards. */
+const RAIL_STYLE = { width: '2.25rem' }
+const RAIL_LABEL_STYLE = { writingMode: 'vertical-rl' }
+
+function BoardColumn({ collapsed, column, columns, now, onMove, onSelect, onToggle, selectedId }) {
   const [over, setOver] = useState(false)
   const meta = columnMeta(column.name)
   const locked = isLockedTarget(column.name)
@@ -2593,6 +2651,49 @@ function BoardColumn({ column, columns, now, onMove, onSelect, selectedId }) {
         onMove(id, column.name)
       }
     }
+  }
+
+  // Collapsed: a rail barely wider than its dot, with the label on its side.
+  // Still a live drop target — the whole point of collapsing an empty lane is
+  // that you can still drag a card into it — and a click opens it again.
+  if (collapsed) {
+    return jsxs('button', {
+      ...dragHandlers,
+      'aria-label': `${meta.label} ausklappen`,
+      className: cn(
+        'flex h-full shrink-0 cursor-pointer flex-col items-center gap-1.5 rounded-lg p-1.5 transition-colors hover:bg-(--ui-bg-quinary)',
+        over && !locked && 'bg-(--ui-bg-quinary) ring-1 ring-(--color-primary)/40'
+      ),
+      'data-slot': 'kanban-plus-lane-rail',
+      onClick: onToggle,
+      style: RAIL_STYLE,
+      // A rail has no room for the lock icon an open lane shows, and "why did
+      // my drop bounce" is exactly the question a folded locked lane raises.
+      title: locked
+        ? `${meta.label} — diese Spalte vergibt der Dispatcher. Klicken zum Ausklappen.`
+        : `${meta.label} — ausklappen`,
+      type: 'button',
+      children: [
+        jsx('span', {
+          className: 'inline-flex shrink-0',
+          style: { color: meta.tone },
+          children: jsx(Codicon, { name: meta.codicon, size: '0.8rem' })
+        }),
+        jsx('span', {
+          className:
+            'min-h-0 flex-1 truncate text-[0.6875rem] font-semibold tracking-wide text-(--ui-text-secondary) uppercase',
+          style: RAIL_LABEL_STYLE,
+          children: meta.label
+        }),
+        tasks.length > 0
+          ? jsx('span', {
+              className:
+                'shrink-0 rounded-full bg-(--ui-bg-quaternary) px-1 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)',
+              children: tasks.length
+            })
+          : null
+      ]
+    })
   }
 
   return jsxs('section', {
@@ -2630,7 +2731,20 @@ function BoardColumn({ column, columns, now, onMove, onSelect, selectedId }) {
                   size: '0.7rem'
                 })
               })
-            : null
+            : null,
+          // Always rendered, never hover-only: a control that decides what the
+          // board looks like should not be something you have to find.
+          jsx('button', {
+            'aria-label': `${meta.label} einklappen`,
+            className: cn(
+              'grid size-5 shrink-0 cursor-pointer place-items-center rounded text-(--ui-text-quaternary) transition-colors hover:bg-(--ui-bg-quaternary) hover:text-foreground',
+              !locked && 'ml-auto'
+            ),
+            onClick: onToggle,
+            title: `${meta.label} — einklappen`,
+            type: 'button',
+            children: jsx(Codicon, { name: 'chevron-left', size: '0.7rem' })
+          })
         ]
       }),
       jsx('div', {
@@ -2648,10 +2762,25 @@ function BoardColumn({ column, columns, now, onMove, onSelect, selectedId }) {
 
 /** The whole board, one lane per status, scrolling sideways when it is wider
  *  than the page. The page owns the query — it needs the same cards to resolve
- *  a selection the running list never carried. */
+ *  a selection the drawer opens on. */
 function BoardColumns({ board, error, isLoading, now, onMove, onSelect, selectedId }) {
   const columns = board?.columns ?? []
   const names = useMemo(() => columns.map(column => column.name), [columns])
+  const overrides = useValue($collapsedLanes)
+  const phase = lanePhase(columns)
+  // The previous signature is STATE, not a ref: React bails out of a set that
+  // changes nothing, so the common poll — where no lane's emptiness moved —
+  // costs no extra render, and nothing lags a render behind what it mirrors.
+  const [previousPhase, setPreviousPhase] = useState(null)
+
+  useEffect(() => {
+    if (!phase || phase === previousPhase) {
+      return
+    }
+
+    setPreviousPhase(phase)
+    $collapsedLanes.set(pruneStaleLanes($collapsedLanes.get(), previousPhase, phase))
+  }, [phase, previousPhase])
 
   if (error) {
     return jsx('div', {
@@ -2675,10 +2804,24 @@ function BoardColumns({ board, error, isLoading, now, onMove, onSelect, selected
   }
 
   return jsx('div', {
-    className: 'flex h-full min-h-0 gap-2 overflow-x-auto px-3 py-3',
+    className: 'flex h-full min-h-0 gap-2 overflow-x-auto overflow-y-hidden px-3 py-3',
     'data-slot': 'kanban-plus-columns',
     children: columns.map(column =>
-      jsx(BoardColumn, { column, columns: names, now, onMove, onSelect, selectedId }, column.name)
+      jsx(
+        BoardColumn,
+        {
+          collapsed: laneCollapsed(overrides, column),
+          column,
+          columns: names,
+          now,
+          onMove,
+          onSelect,
+          onToggle: () =>
+            $collapsedLanes.set(toggleLane($collapsedLanes.get(), column.name, laneAutoCollapsed(column))),
+          selectedId
+        },
+        column.name
+      )
     )
   })
 }
@@ -3004,6 +3147,10 @@ function TaskModelField({ disabled, onPatch, task }) {
   })
 }
 
+/** The meta table's label column, inline for the reason in the file header:
+ *  wide enough for "Abhängigkeiten" without wrapping every label. */
+const META_TABLE_STYLE = { gridTemplateColumns: '5.5rem minmax(0, 1fr)' }
+
 /** Everything about the task that is a fact rather than prose. */
 function TaskMetaTable({ disabled, now, onPatch, task }) {
   const startedMs = parseMs(task.started_at)
@@ -3024,7 +3171,8 @@ function TaskMetaTable({ disabled, now, onPatch, task }) {
   ]
 
   return jsxs('div', {
-    className: 'grid grid-cols-[5.5rem_minmax(0,1fr)] items-center gap-x-3 gap-y-1 text-[0.71rem]',
+    className: 'grid items-center gap-x-3 gap-y-1 text-[0.71rem]',
+    style: META_TABLE_STYLE,
     children: [
       jsx(MetaRow, { label: 'Modell', children: jsx(TaskModelField, { disabled, onPatch, task }) }),
       ...rows
@@ -3177,6 +3325,19 @@ const ADMIN_SUMMARY_RE = /^status changed to \w+ \(dashboard\/direct\)$/
  * The task view: everything core's drawer shows, plus the worker context meter
  * and the small worker log whose four-arrow button takes over the page.
  */
+/** The task drawer's size, inline for the reason in the file header.
+ *
+ *  A third of the board, floored at 22rem — below that the meta table's two
+ *  columns collide and the log gutter stops being readable — and capped at the
+ *  board area itself. One `min(100%, max(…))` rather than a width/min-width/
+ *  max-width trio, because CSS lets min-width beat max-width: a pane narrower
+ *  than the floor would be overflowed by its own drawer, which is exactly the
+ *  sideways scrollbar this layout exists to get rid of. */
+const PANEL_STYLE = {
+  boxShadow: '-8px 0 24px -12px rgba(0, 0, 0, 0.45)',
+  width: 'min(100%, max(22rem, 33.3333%))'
+}
+
 function TaskDetailPanel({ card, columns, onClose, onExpandLog, onOpen, taskId }) {
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
@@ -3216,10 +3377,13 @@ function TaskDetailPanel({ card, columns, onClose, onExpandLog, onOpen, taskId }
 
   useTicker(running, 1_000)
 
+  // A drawer OVER the board, like core's task drawer — not a third column that
+  // squeezes the lanes into a sideways scroll every time a card is clicked.
   return jsxs('aside', {
     className:
-      'flex w-96 max-w-[55%] shrink-0 flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated)',
+      'absolute inset-y-0 right-0 z-20 flex flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) duration-150 ease-out animate-in fade-in slide-in-from-right-4',
     'data-slot': 'kanban-plus-task',
+    style: PANEL_STYLE,
     children: [
       jsxs('header', {
         className: 'flex shrink-0 flex-col gap-2 border-b border-(--ui-stroke-tertiary) px-4 pt-3 pb-2.5',
@@ -3311,14 +3475,15 @@ function TaskDetailPanel({ card, columns, onClose, onExpandLog, onOpen, taskId }
 
 // ── the page ─────────────────────────────────────────────────────────────────
 
+/** How much of a stop reason the page header shows before truncating it. */
+const STOP_REASON_STYLE = { maxWidth: '18rem' }
+
 function KanbanPlusPage() {
   const slug = useValue($boardSlug)
   const [selectedId, setSelectedId] = useState(() => readSelectedTask($boardSlug.get()))
   // The worker log, blown up over the whole page. Off by default; Esc and the
   // same four-arrow button both put the task's details back.
   const [logExpanded, setLogExpanded] = useState(false)
-  // Which board already got its one automatic "land on a running task".
-  const autoLanded = useRef('')
   const move = useTaskMove()
 
   // A task id belongs to the board it came from, so a switch re-reads THAT
@@ -3359,13 +3524,16 @@ function KanbanPlusPage() {
     return names.length > 0 ? names : BOARD_COLUMN_ORDER
   }, [board])
 
-  // One ticker for the whole list: N running rows must not mean N intervals.
+  // One ticker for the whole page: the cards in Läuft each show a live elapsed
+  // time, and N of them must not mean N intervals.
   useTicker(running.length > 0, 1_000)
 
   const now = Date.now()
 
-  // A card can sit in a lane the running list does not reach (an old Todo,
-  // say), and picking one still has to open its details.
+  // Resolve the selection against everything this page knows about. The lanes
+  // are the usual source, but a remembered id can point at a task the board
+  // payload no longer carries (archived, or filtered out) — the tasks query
+  // still has it, and the drawer should open rather than blink shut.
   const selected = useMemo(() => {
     const cards = (board?.columns ?? []).flatMap(column => column.tasks ?? [])
 
@@ -3381,20 +3549,16 @@ function KanbanPlusPage() {
     }
   }
 
-  // Nothing resolved (first open, or a remembered id whose task was pruned) and
-  // something IS running: land on it rather than leaving the panel on a dead
-  // selection. Only runs once the first task payload arrived — before that an
-  // empty `running` says nothing about whether the id is still valid. Once per
-  // board, so closing the panel keeps the lanes full width instead of having
-  // the next poll re-open it.
+  // A remembered id whose task no longer exists must not leave the drawer open
+  // over an empty box. Nothing takes its place: the drawer is the reader's to
+  // open, and a page that opens one by itself just hides a third of the board.
   useEffect(() => {
-    if (tasks && !selected && running.length > 0 && autoLanded.current !== slug) {
-      autoLanded.current = slug
-      select(running[0].id)
+    if (tasks && board && selectedId && !selected) {
+      select(null)
     }
     // `select` is stable enough (it only wraps two setters) to leave out.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [running, selected, slug, tasks])
+  }, [board, selected, selectedId, tasks])
 
   // Esc unwinds one layer at a time: the big log first, then the task view —
   // the same order the reader opened them in.
@@ -3437,7 +3601,7 @@ function KanbanPlusPage() {
   const since = formatStamp(state?.stopped_at)
 
   return jsxs('div', {
-    className: 'relative flex h-full min-h-0 flex-col bg-(--ui-surface-background)',
+    className: 'relative flex h-full min-h-0 flex-col overflow-hidden bg-(--ui-surface-background)',
     'data-slot': 'kanban-plus-page',
     children: [
       jsxs('header', {
@@ -3459,7 +3623,8 @@ function KanbanPlusPage() {
           }),
           stopped && state?.reason
             ? jsx('span', {
-                className: 'max-w-[18rem] truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+                className: 'truncate text-[0.6875rem] text-(--ui-text-tertiary)',
+                style: STOP_REASON_STYLE,
                 title: state.reason,
                 children: state.reason
               })
@@ -3486,19 +3651,13 @@ function KanbanPlusPage() {
           jsx(PluginUpdateField, {})
         ]
       }),
+      // The lanes own the whole width. The task drawer floats over them on the
+      // right rather than taking a column of its own, so opening a card never
+      // narrows the board — `relative` anchors it, `overflow-hidden` keeps
+      // both it and the lane strip inside the page.
       jsxs('div', {
-        className: 'flex min-h-0 flex-1 border-t border-(--ui-stroke-tertiary)',
+        className: 'relative flex min-h-0 flex-1 overflow-hidden border-t border-(--ui-stroke-tertiary)',
         children: [
-          // Only the running workers: the lanes already carry everything else,
-          // and this list adds what they cannot — a live clock per worker.
-          running.length > 0
-            ? jsx('aside', {
-                className: 'w-60 shrink-0 overflow-y-auto border-r border-(--ui-stroke-tertiary)',
-                children: jsx(TaskGroup, { label: 'Laufend', now, onSelect: select, selectedId, tasks: running })
-              })
-            : null,
-          // The lanes own the page; the task view opens beside them for the
-          // card the reader picked, and gives the space back on close.
           jsx('div', {
             className: 'min-h-0 min-w-0 flex-1',
             children: jsx(BoardColumns, {
@@ -3713,18 +3872,28 @@ const plugin = {
     restCall = ctx.rest
     osDoor = ctx.os
 
-    // The picked board is a setting, not a session detail: hydrate it from the
-    // plugin's own storage and keep that storage in sync with the atom.
+    // The picked board and the lanes the reader keeps folded are settings, not
+    // session details: hydrate both from the plugin's own storage and keep that
+    // storage in sync with the atoms.
     const storage = ctx.storage
 
     $boardSlug.set(storage?.get(BOARD_SLUG_KEY, '') ?? '')
 
-    const unlisten = storage ? $boardSlug.listen(value => storage.set(BOARD_SLUG_KEY, value)) : () => {}
+    const lanes = storage?.get(COLLAPSED_LANES_KEY, null)
+
+    $collapsedLanes.set(lanes && typeof lanes === 'object' ? lanes : {})
+
+    const unlisten = storage
+      ? [
+          $boardSlug.listen(value => storage.set(BOARD_SLUG_KEY, value)),
+          $collapsedLanes.listen(value => storage.set(COLLAPSED_LANES_KEY, value))
+        ]
+      : []
 
     // Disk plugins hot-reload on every save; drop the doors so a stale closure
     // can never keep calling through a context that was torn down.
     ctx.onDispose(() => {
-      unlisten()
+      unlisten.forEach(dispose => dispose())
       restCall = null
       osDoor = null
     })

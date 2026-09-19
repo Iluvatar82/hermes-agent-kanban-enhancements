@@ -37,6 +37,33 @@ def setting(key: str, default: Any = None) -> Any:
     return default if value is None else value
 
 
+#: Attribute stamped on every function this plugin installs over a core one.
+#: The flag that says "the patch is in" therefore lives on the PATCHED OBJECT,
+#: not in a module global: a gateway can hold several copies of this package
+#: (one per Hermes home — ``plugins_loader`` gives every scope its own module
+#: name), and a global would make one copy's answer a lie about the process.
+PATCH_MARKER = "__kanban_enhancements_patch__"
+
+
+def stamp(wrapper: Callable, name: str, original: Callable) -> Callable:
+    """Mark ``wrapper`` as this plugin's replacement for ``original``."""
+    setattr(wrapper, PATCH_MARKER, name)
+    wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+    return wrapper
+
+
+def patched(owner: Any, attr: str, name: str) -> bool:
+    """True when ``owner.attr`` is the patch called ``name`` — whichever copy of
+    this package installed it."""
+    return getattr(getattr(owner, attr, None), PATCH_MARKER, None) == name
+
+
+def original_of(owner: Any, attr: str) -> Any:
+    """What ``owner.attr`` wrapped, so an uninstall can restore it even when
+    another copy of this package did the wrapping."""
+    return getattr(getattr(owner, attr, None), "__wrapped__", None)
+
+
 def guarded(what: str) -> Callable:
     """Decorator: never let this plugin raise into Hermes."""
 

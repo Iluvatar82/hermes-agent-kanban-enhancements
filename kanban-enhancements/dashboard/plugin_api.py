@@ -31,17 +31,37 @@ _SYNTHETIC_NAME = "hermes_kanban_enhancements"
 
 router = APIRouter()
 
+
+def _same_file(left: str, right: str) -> bool:
+    """Whether two paths name one file, spelling aside. Never raises: a path
+    that has since been deleted is simply not a match."""
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return False
+
 #: The version of the code THIS PROCESS imported — deliberately a literal and
 #: not a read of plugin.yaml, because an update swaps that file while this
 #: module stays loaded and the difference is what "restart required" means.
 #: tests/test_manifest.py keeps it equal to the manifest.
-_PLUGIN_VERSION = "0.3.0"
+_PLUGIN_VERSION = "0.4.0"
 
 
 def _package():
-    """The plugin package: the loader's own copy when it is already imported."""
+    """The plugin package: the loader's own copy when it is already imported.
+
+    Matched on the RESOLVED ``__file__``. The loader stores the path exactly as
+    discovery spelled it, this file resolves its own — on Windows the two can
+    differ by case, by an 8.3 short name or by a junction, and a miss meant a
+    second, never-registered copy of the package whose patch flags all read
+    False while the real ones were live (the "board model is set but patches
+    nowhere" banner).
+    """
     for module in list(sys.modules.values()):
-        if getattr(module, "__file__", None) == _PKG_INIT and hasattr(module, "board_control"):
+        candidate = getattr(module, "__file__", None)
+        if not candidate or not hasattr(module, "board_control"):
+            continue
+        if candidate == _PKG_INIT or _same_file(candidate, _PKG_INIT):
             return module
     existing = sys.modules.get(_SYNTHETIC_NAME)
     if existing is not None:
@@ -217,6 +237,12 @@ def _running_count(conn) -> int:
 
 def _state_payload(board: str | None) -> dict[str, Any]:
     pkg = _package()
+    # Repair before reporting. The patches are installed at plugin load, which
+    # in a gateway is the one moment the modules they wrap may not be
+    # importable yet; re-installing here is idempotent (a marker read when
+    # everything is in place) and means opening the page fixes a board model
+    # that would otherwise have stayed inert until the next gateway restart.
+    pkg.ensure_patches()
     configured, explicit = pkg.dispatch_guard.configured_cap()
     with _kanban_conn(board) as conn:
         running = _running_count(conn)
