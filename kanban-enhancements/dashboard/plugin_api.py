@@ -44,7 +44,7 @@ def _same_file(left: str, right: str) -> bool:
 #: not a read of plugin.yaml, because an update swaps that file while this
 #: module stays loaded and the difference is what "restart required" means.
 #: tests/test_manifest.py keeps it equal to the manifest.
-_PLUGIN_VERSION = "0.5.1"
+_PLUGIN_VERSION = "0.6.0"
 
 
 def _package():
@@ -90,9 +90,12 @@ def _package():
 
 class UpdateBody(BaseModel):
     """``ref`` pins one immutable commit, exactly like ``--ref``; empty = the
-    source's default branch."""
+    source's default branch. ``all_profiles`` installs into every Hermes
+    profile instead of only the one this gateway runs under — what
+    ``scripts/update.ps1`` does, from the page."""
 
     ref: str | None = Field(None, max_length=64)
+    all_profiles: bool = False
 
 
 def _version_payload(check: bool) -> dict[str, Any]:
@@ -127,13 +130,59 @@ def get_version(check: bool = Query(True, description="Also ask the source repos
     return _version_payload(wanted)
 
 
+@router.get("/profiles")
+def get_profiles():
+    """Every Hermes profile and the plugin version installed in it.
+
+    What the update row needs to offer "all profiles" honestly: which profiles
+    exist, which one this gateway runs under, and which of them are behind.
+    ``supported: false`` means this Hermes cannot be pointed at another
+    profile's home from here — the page then keeps the single-profile button.
+    """
+    pkg = _package()
+    return {
+        "supported": pkg.profile_update.supported(),
+        "running": _PLUGIN_VERSION,
+        "profiles": pkg.profile_update.list_profiles(),
+    }
+
+
+async def _update_every_profile(pkg, source: str, ref: str | None) -> dict[str, Any]:
+    """Install into every profile, off the event loop (a git clone each)."""
+    if not pkg.profile_update.supported():
+        raise HTTPException(
+            status_code=503,
+            detail="this Hermes does not expose hermes_constants.set_hermes_home_override, so Kanban+ "
+                   "cannot install into another profile from here; use scripts/update.ps1")
+    with _errors_to_500("update failed"):
+        rows = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: pkg.profile_update.install_all(source, ref))
+    if not rows:
+        raise HTTPException(status_code=500, detail="no Hermes profile could be resolved")
+    failed = [row["name"] for row in rows if not row.get("ok")]
+    installed = next((row["installed"] for row in rows if row.get("current")), "")
+    return {
+        **_version_payload(False),
+        # Partial success is still a failure to report: the rows say which
+        # profile refused, and nothing pretends the other ones did not land.
+        "ok": not failed,
+        "installed": installed,
+        "restart_required": bool(installed and installed != _PLUGIN_VERSION),
+        "profiles": rows,
+        "failed": failed,
+        "warnings": sorted({warning for row in rows for warning in (row.get("warnings") or [])}),
+    }
+
+
 @router.post("/update")
-def update_plugin(payload: UpdateBody | None = None):
+async def update_plugin(payload: UpdateBody | None = None):
     """Reinstall this plugin from its own source, then report what landed.
 
     Installing REPLACES the directory this module was imported from, so the
     gateway keeps serving the old code until it restarts — ``restart_required``
     in the response says so rather than leaving the caller to guess.
+    ``all_profiles`` does the same for every profile on the machine and answers
+    with one row per profile.
     """
     pkg = _package()
     if not pkg.self_update.available():
@@ -144,8 +193,11 @@ def update_plugin(payload: UpdateBody | None = None):
     with _value_error_400():
         ref = pkg.self_update.normalize_ref(payload.ref if payload else None)
     source = pkg.self_update.installed_source()
+    if payload is not None and payload.all_profiles:
+        return await _update_every_profile(pkg, source, ref)
     with _errors_to_500("update failed"):
-        result = pkg.self_update.install(source, ref)
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: pkg.self_update.install(source, ref))
     if not result.get("ok"):
         # The installer reports a refusal (a blocked scan, a bad ref, a
         # network failure) in its payload rather than by raising.
@@ -495,7 +547,12 @@ class TaskPatchBody(BaseModel):
     """What the task view may change. Mirrors the subset of core's
     ``UpdateTaskBody`` this plugin's page actually offers; unsent fields are
     left alone (``exclude_unset`` below), and ``clear_model_override`` is the
-    explicit "back to the profile's model" signal a ``None`` cannot carry."""
+    explicit "back to the profile's model" signal a ``None`` cannot carry.
+
+    ``skills`` is the one exception and :data:`_OWN_PATCH_FIELDS` names it:
+    core's update body has no such field, so that half is applied by this
+    plugin's own ``task_skills`` writer (which is why it may be edited at all).
+    """
 
     status: str | None = Field(None, max_length=50)
     title: str | None = Field(None, max_length=500)
@@ -505,6 +562,14 @@ class TaskPatchBody(BaseModel):
     model_override: str | None = Field(None, max_length=200)
     provider_override: str | None = Field(None, max_length=100)
     clear_model_override: bool = False
+    #: ``[]`` clears the task's skills; an unsent field leaves them alone.
+    skills: list[str] | None = Field(None, max_length=50)
+
+
+#: Patch fields Kanban+ writes ITSELF instead of handing to core — they are
+#: deliberately absent from ``UpdateTaskBody``, so the drift test that holds
+#: this body against core's excludes exactly these.
+_OWN_PATCH_FIELDS = frozenset({"skills"})
 
 
 # The lanes the dispatcher hands out. Core refuses a bare status move into
@@ -629,23 +694,64 @@ def create_task(payload: TaskCreateBody, board: str | None = _BOARD_Q):
     return result
 
 
+def _write_skills(task_id: str, skills: list[str] | None, slug: str | None) -> list[str] | None:
+    """The half core cannot do: ``tasks.skills``, written by this plugin.
+
+    404 for a task that is gone, 400 for a name core refuses or an archived
+    task — the same answers the delegated half gives for the same mistakes.
+    """
+    pkg = _package()
+    with _kanban_conn(slug) as conn:
+        try:
+            return pkg.task_skills.set_skills(conn, task_id, skills)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=f"task {task_id} does not exist") from exc
+        except (RuntimeError, ValueError) as exc:
+            # A name core refuses, or an archived task: the caller's mistake,
+            # and the message is the one `kanban create --skills` would print.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"could not update the task: {exc}") from exc
+
+
 @router.patch("/tasks/{task_id}")
 def patch_task(task_id: str, payload: TaskPatchBody, board: str | None = _BOARD_Q):
     """Move a task to another column (drag & drop, the card menu, the status
     menu) or edit one of its fields — delegated to core's kanban API so the
-    transition rules are the ones the rest of Hermes enforces."""
+    transition rules are the ones the rest of Hermes enforces.
+
+    ``skills`` is the one field core's API does not carry; it is written here
+    (see ``task_skills``) and left out of what is handed to core. A patch that
+    carries both does the delegated half first, so a refused status move never
+    leaves the skills edited on a task that did not move.
+    """
     core = _core_kanban_api_or_503()
     slug = _resolve_board(board)
     fields = payload.model_dump(exclude_unset=True)
     if not fields:
         raise HTTPException(status_code=400, detail="nothing to change")
+    # `skills: null` is a clear, not "unsent" — the sent/unsent line is the
+    # model's own field set, never the value.
+    edits_skills = "skills" in payload.model_fields_set
+    skills = fields.pop("skills", None)
     unknown = sorted(set(fields) - set(core.UpdateTaskBody.model_fields))
     if unknown:
         raise HTTPException(
             status_code=501,
             detail=f"this Hermes' kanban API does not accept: {', '.join(unknown)}")
-    with _errors_to_500("could not update the task"):
-        return core.update_task(task_id, core.UpdateTaskBody(**fields), board=slug)
+
+    result: dict[str, Any] = {}
+    if fields:
+        with _errors_to_500("could not update the task"):
+            result = core.update_task(task_id, core.UpdateTaskBody(**fields), board=slug) or {}
+    if edits_skills:
+        stored = _write_skills(task_id, skills or [], slug)
+        task = result.get("task")
+        if isinstance(task, dict):
+            task["skills"] = stored
+        else:
+            result = {**result, "task": {"id": task_id, "skills": stored}}
+    return result
 
 
 @router.post("/tasks/{task_id}/comments")

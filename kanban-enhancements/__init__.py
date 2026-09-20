@@ -24,13 +24,15 @@ from . import (
     core,
     dispatch_guard,
     log_stamps,
+    profile_update,
     self_update,
+    task_skills,
     worker_context,
 )
 from .core import logger
 
 __all__ = ["register", "ensure_patches", "board_control", "board_model", "dispatch_guard",
-           "log_stamps", "self_update", "worker_context"]
+           "log_stamps", "profile_update", "self_update", "task_skills", "worker_context"]
 
 _SETTING_KEYS = (
     "stop_terminates_workers",

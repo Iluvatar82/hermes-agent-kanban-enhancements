@@ -2,7 +2,7 @@
   "name": "kanban-enhancements",
   "label": "Kanban Enhancements",
   "description": "Board stop/start, live parallel-run cap, timestamped worker logs and worker context snapshots.",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "tab": {
     "hidden": true
   },

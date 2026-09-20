@@ -431,6 +431,78 @@ def test_patch_says_so_when_cores_kanban_api_is_out_of_reach(client, api, monkey
     assert answer.status_code == 503 and "kanban" in answer.json()["detail"]
 
 
+def test_patch_writes_skills_itself_and_never_sends_them_to_core(client, pkg, fake_core, monkeypatch):
+    """Core's update body has no ``skills`` field — so this half is ours, and
+    core must not be handed a field it would refuse."""
+    written = []
+    monkeypatch.setattr(pkg.task_skills, "set_skills",
+                        lambda conn, task_id, skills: written.append((task_id, skills)) or list(skills))
+
+    answer = client.patch("/api/plugins/kanban-enhancements/tasks/t_1", json={"skills": ["python", "review"]})
+
+    assert answer.status_code == 200
+    assert written == [("t_1", ["python", "review"])]
+    assert answer.json()["task"]["skills"] == ["python", "review"]
+    # Nothing was delegated: there was nothing core could do with it.
+    assert fake_core == []
+
+
+def test_patch_splits_a_mixed_edit_between_core_and_this_plugin(client, pkg, fake_core, monkeypatch):
+    written = []
+    monkeypatch.setattr(pkg.task_skills, "set_skills",
+                        lambda conn, task_id, skills: written.append(skills) or list(skills))
+
+    body = client.patch("/api/plugins/kanban-enhancements/tasks/t_1",
+                        json={"status": "ready", "skills": ["python"]}).json()
+
+    assert fake_core == [{"task_id": "t_1", "fields": {"status": "ready"}, "board": None}]
+    assert written == [["python"]]
+    # One task in the answer, carrying both halves.
+    assert body["task"]["status"] == "ready" and body["task"]["skills"] == ["python"]
+
+
+def test_patch_reads_an_empty_skills_list_as_a_clear(client, pkg, fake_core, monkeypatch):
+    written = []
+    monkeypatch.setattr(pkg.task_skills, "set_skills",
+                        lambda conn, task_id, skills: written.append(skills) or None)
+
+    body = client.patch("/api/plugins/kanban-enhancements/tasks/t_1", json={"skills": []}).json()
+
+    assert written == [[]] and body["task"]["skills"] is None
+
+
+def test_patch_that_does_not_mention_skills_leaves_them_alone(client, pkg, fake_core, monkeypatch):
+    monkeypatch.setattr(pkg.task_skills, "set_skills",
+                        lambda *a, **k: pytest.fail("skills were written by a patch that never sent them"))
+
+    assert client.patch("/api/plugins/kanban-enhancements/tasks/t_1",
+                        json={"body": "new text"}).status_code == 200
+
+
+def test_a_skill_name_core_refuses_is_a_400_and_an_unknown_task_a_404(client, pkg, fake_core, monkeypatch):
+    def refuse(conn, task_id, skills):
+        if task_id != "t_1":
+            raise LookupError(task_id)
+        raise ValueError("skill name cannot contain comma: 'a,b'")
+
+    monkeypatch.setattr(pkg.task_skills, "set_skills", refuse)
+
+    bad = client.patch("/api/plugins/kanban-enhancements/tasks/t_1", json={"skills": ["a,b"]})
+    assert bad.status_code == 400 and "comma" in bad.json()["detail"]
+    gone = client.patch("/api/plugins/kanban-enhancements/tasks/t_nope", json={"skills": ["a"]})
+    assert gone.status_code == 404
+
+
+def test_an_archived_task_refuses_a_skills_edit(client, pkg, fake_core, monkeypatch):
+    def refuse(conn, task_id, skills):
+        raise RuntimeError("cannot set skills on archived task t_1")
+
+    monkeypatch.setattr(pkg.task_skills, "set_skills", refuse)
+
+    answer = client.patch("/api/plugins/kanban-enhancements/tasks/t_1", json={"skills": ["a"]})
+    assert answer.status_code == 400 and "archived" in answer.json()["detail"]
+
+
 def test_a_comment_lands_on_the_task(client, pkg, one_task, monkeypatch):
     written = []
     monkeypatch.setattr(pkg.core.kanban_db(), "add_comment",
@@ -450,11 +522,25 @@ def test_a_comment_on_an_unknown_task_is_404_and_an_empty_one_is_refused(client,
 
 def test_the_patch_fields_are_the_fields_cores_kanban_api_accepts(api):
     """The delegation seam itself, against the real checkout: a Hermes that
-    renamed one of these must fail HERE and not at the first drag on a board."""
+    renamed one of these must fail HERE and not at the first drag on a board.
+
+    Minus the fields Kanban+ writes itself — ``skills`` is in this body
+    precisely BECAUSE core's has no such field.
+    """
     core = api._core_kanban_api()
     assert core is not None, "core's kanban plugin API could not be loaded"
-    assert set(api.TaskPatchBody.model_fields) <= set(core.UpdateTaskBody.model_fields)
+    delegated = set(api.TaskPatchBody.model_fields) - api._OWN_PATCH_FIELDS
+    assert delegated <= set(core.UpdateTaskBody.model_fields)
     assert callable(core.update_task)
+
+
+def test_the_field_kanban_plus_writes_itself_is_still_one_core_cannot(api):
+    """The other half of that seam: the day core's update body grows a
+    ``skills`` field, this plugin should hand it over instead of writing the
+    column by hand — and this is the test that says so."""
+    core = api._core_kanban_api()
+    assert core is not None, "core's kanban plugin API could not be loaded"
+    assert api._OWN_PATCH_FIELDS.isdisjoint(core.UpdateTaskBody.model_fields)
 
 
 # --- Adding a task to a lane ------------------------------------------------
@@ -647,3 +733,67 @@ def test_update_says_so_when_this_hermes_has_no_installer(client, no_probe, pkg,
 
     answer = client.post("/api/plugins/kanban-enhancements/update", json={})
     assert answer.status_code == 503 and "plugins install" in answer.json()["detail"]
+
+
+# --- Updating every profile ---------------------------------------------------
+
+
+def test_profiles_lists_what_is_installed_where(client, pkg, monkeypatch):
+    rows = [{"name": "default", "home": "/h", "current": True, "installed": "0.5.0"},
+            {"name": "dev", "home": "/h/profiles/dev", "current": False, "installed": "0.4.0"}]
+    monkeypatch.setattr(pkg.profile_update, "list_profiles", lambda: rows)
+    monkeypatch.setattr(pkg.profile_update, "supported", lambda: True)
+
+    body = client.get("/api/plugins/kanban-enhancements/profiles").json()
+    assert body["supported"] is True and body["profiles"] == rows
+
+
+def test_update_all_profiles_installs_into_each_of_them(client, no_probe, pkg, api, monkeypatch):
+    calls = []
+
+    def install_all(source, ref):
+        calls.append((source, ref))
+        return [{"name": "default", "current": True, "ok": True, "installed": "0.9.9", "was": "0.5.0"},
+                {"name": "dev", "current": False, "ok": True, "installed": "0.9.9", "was": "0.4.0"}]
+
+    monkeypatch.setattr(pkg.profile_update, "supported", lambda: True)
+    monkeypatch.setattr(pkg.profile_update, "install_all", install_all)
+
+    body = client.post("/api/plugins/kanban-enhancements/update", json={"all_profiles": True}).json()
+
+    # Still the recorded source, never one from the request.
+    assert calls == [("https://github.com/o/r.git#sub", None)]
+    assert body["ok"] is True and body["failed"] == []
+    assert [row["name"] for row in body["profiles"]] == ["default", "dev"]
+    # The gateway's own profile decides whether a restart is pending.
+    assert body["installed"] == "0.9.9" and body["restart_required"] is True
+
+
+def test_one_profile_refusing_makes_the_whole_update_a_failure_that_names_it(
+        client, no_probe, pkg, monkeypatch):
+    monkeypatch.setattr(pkg.profile_update, "supported", lambda: True)
+    monkeypatch.setattr(pkg.profile_update, "install_all", lambda source, ref: [
+        {"name": "default", "current": True, "ok": True, "installed": "0.9.9", "warnings": ["custom source"]},
+        {"name": "dev", "current": False, "ok": False, "installed": "0.4.0", "error": "scan blocked"}])
+
+    body = client.post("/api/plugins/kanban-enhancements/update", json={"all_profiles": True}).json()
+
+    assert body["ok"] is False and body["failed"] == ["dev"]
+    assert body["warnings"] == ["custom source"]
+
+
+def test_update_all_profiles_says_so_when_this_hermes_cannot_reach_them(client, no_probe, pkg, monkeypatch):
+    monkeypatch.setattr(pkg.profile_update, "supported", lambda: False)
+
+    answer = client.post("/api/plugins/kanban-enhancements/update", json={"all_profiles": True})
+    assert answer.status_code == 503 and "update.ps1" in answer.json()["detail"]
+
+
+def test_a_plain_update_still_touches_only_this_profile(client, no_probe, pkg, monkeypatch):
+    monkeypatch.setattr(pkg.self_update, "install",
+                        lambda source, ref: {"ok": True, "installed_version": "0.9.9"})
+    monkeypatch.setattr(pkg.profile_update, "install_all",
+                        lambda *a, **k: pytest.fail("a single-profile update reached every profile"))
+
+    body = client.post("/api/plugins/kanban-enhancements/update", json={}).json()
+    assert body["ok"] is True and "profiles" not in body

@@ -821,3 +821,185 @@ describe('page layout', () => {
     assert.match(source, /const SMALL_LOG_STYLE = \{ maxHeight: '\d+rem', minHeight: '200px' \}/)
   })
 })
+
+// ── what the full log's lines are ───────────────────────────────────────────
+
+describe('classifyLogRule', () => {
+  it('reads the frame the CLI draws a response in', () => {
+    // What a worker log actually carries: the box padded to the width of the
+    // terminal the worker ran in, title and all.
+    assert.deepEqual(plugin.classifyLogRule('╭─ ☤ Hermes  15:28────────────────────────╮'), {
+      edge: 'top',
+      label: '☤ Hermes  15:28'
+    })
+    assert.deepEqual(plugin.classifyLogRule('╰─────────────────────────────────────────╯'), {
+      edge: 'bottom',
+      label: ''
+    })
+    assert.deepEqual(plugin.classifyLogRule('┌─ Reasoning ─────────────────────────────┐'), {
+      edge: 'top',
+      label: 'Reasoning'
+    })
+  })
+
+  it('reads a bare rule, and only when it is long enough to be one', () => {
+    assert.deepEqual(plugin.classifyLogRule('────────────────────────'), { edge: 'plain', label: '' })
+    assert.equal(plugin.classifyLogRule('───'), null)
+  })
+
+  it('leaves ordinary lines — and prose that merely contains a dash — alone', () => {
+    assert.equal(plugin.classifyLogRule('All automated checks pass (96/96 files)'), null)
+    assert.equal(plugin.classifyLogRule('  ┊ $ python review.py   0.5s'), null)
+    assert.equal(plugin.classifyLogRule('the run — which took 4m — is done'), null)
+    assert.equal(plugin.classifyLogRule(''), null)
+    assert.equal(plugin.classifyLogRule(undefined), null)
+  })
+})
+
+describe('diffTone', () => {
+  it('colours a unified diff the way a terminal would have', () => {
+    assert.equal(plugin.diffTone('+    return True, im2.format'), 'plus')
+    assert.equal(plugin.diffTone('-    return True, im2.size'), 'minus')
+    assert.equal(plugin.diffTone('@@ -40,10 +40,20 @@'), 'hunk')
+    assert.equal(plugin.diffTone('a/scripts/restore.py → b/scripts/restore.py'), 'file')
+    assert.equal(plugin.diffTone('     try:'), 'context')
+    assert.equal(plugin.diffTone('… omitted 103 diff line(s) across 1 additional file(s)'), 'hunk')
+  })
+
+  it('ends at the tool gutter, which is what follows a diff', () => {
+    // It starts with a space like a context line does — reading it as one
+    // swallowed every tool line after a diff into the diff.
+    assert.equal(plugin.diffTone('  ┊ ✓ patch applied'), null)
+    assert.equal(plugin.diffTone('Angewendet.'), null)
+    assert.equal(plugin.diffTone(''), null)
+  })
+})
+
+describe('workerExitCode', () => {
+  it('reads the last line a kanban worker writes', () => {
+    assert.equal(plugin.workerExitCode('[kanban-worker-exit] rc=0'), 0)
+    assert.equal(plugin.workerExitCode('[kanban-worker-exit] rc=75'), 75)
+    assert.equal(plugin.workerExitCode('  [kanban-worker-exit] rc=-1'), -1)
+  })
+
+  it('is null for everything else, including a line that talks about it', () => {
+    assert.equal(plugin.workerExitCode('waiting for [kanban-worker-exit] rc=0'), null)
+    assert.equal(plugin.workerExitCode('rc=0'), null)
+    assert.equal(plugin.workerExitCode(undefined), null)
+  })
+})
+
+describe('decorateLogRows', () => {
+  const stamp = '[2026-09-20T15:28:04+02:00] '
+  const log = [
+    `${stamp}╭─ ☤ Hermes  15:28──────────────────────╮`,
+    `${stamp}All automated checks pass`,
+    `${stamp}`,
+    `${stamp}╰───────────────────────────────────────╯`,
+    `${stamp}  ┊ $ python review.py   0.5s`,
+    `${stamp}  ┊ review diff`,
+    `${stamp}a/scripts/restore.py → b/scripts/restore.py`,
+    `${stamp}@@ -40,10 +40,20 @@`,
+    `${stamp}-    return True, im2.size`,
+    `${stamp}+    return True, im2.format`,
+    `${stamp}  ┊ ✓ patch applied`,
+    `${stamp}[kanban-worker-exit] rc=0`,
+    ''
+  ].join('\n')
+
+  const rows = plugin.decorateLogRows(plugin.buildLogRows(log))
+
+  it('reads a transcript into the kinds the view draws', () => {
+    assert.deepEqual(rows.map(row => row.kind), [
+      'day', 'rule', 'line', 'line', 'rule', 'line', 'diff', 'diff', 'diff', 'diff', 'diff', 'line', 'exit'
+    ])
+  })
+
+  it('marks the lines a frame encloses, and only those', () => {
+    assert.deepEqual(rows.filter(row => row.framed).map(row => row.text), [
+      'All automated checks pass', ''
+    ])
+  })
+
+  it('carries the rule’s title so the view can redraw the frame at its own width', () => {
+    const [top, bottom] = rows.filter(row => row.kind === 'rule')
+
+    assert.deepEqual([top.edge, top.label], ['top', '☤ Hermes  15:28'])
+    assert.deepEqual([bottom.edge, bottom.label], ['bottom', ''])
+  })
+
+  it('tones a diff run and stops at the next tool line', () => {
+    assert.deepEqual(rows.filter(row => row.kind === 'diff').map(row => row.tone), [
+      'marker', 'file', 'hunk', 'minus', 'plus'
+    ])
+    assert.equal(rows.at(-2).kind, 'line')
+  })
+
+  it('keeps the exit code, which is what makes the end of a run visible', () => {
+    assert.equal(rows.at(-1).code, 0)
+  })
+
+  it('survives a tail that starts mid-frame, and empty input', () => {
+    const cut = plugin.decorateLogRows(plugin.buildLogRows('still inside the box\n╰──────────╯\nafter\n'))
+
+    // No opening rule in this tail, so nothing claims to be framed.
+    assert.deepEqual(cut.map(row => Boolean(row.framed)), [false, false, false])
+    assert.deepEqual(plugin.decorateLogRows(undefined), [])
+  })
+})
+
+describe('anchorOffset', () => {
+  it('centres the breakdown card on the pointer', () => {
+    // A meter that spans a window is a long way from a card pinned to its end.
+    assert.equal(plugin.anchorOffset({ left: 100, pointerX: 500, width: 240 }), 280)
+    assert.equal(plugin.anchorOffset({ left: 100, pointerX: 100, width: 240 }), -120)
+  })
+
+  it('falls back to the caller’s alignment when no pointer was seen', () => {
+    assert.equal(plugin.anchorOffset({ left: 100, pointerX: null }), null)
+    assert.equal(plugin.anchorOffset({ left: undefined, pointerX: 500 }), null)
+  })
+})
+
+describe('skillsText', () => {
+  it('round-trips through what the create dialog parses', () => {
+    assert.equal(plugin.skillsText(['python', 'review']), 'python, review')
+    assert.deepEqual(plugin.parseSkills(plugin.skillsText(['python', 'review'])), ['python', 'review'])
+    assert.equal(plugin.skillsText(null), '')
+    assert.equal(plugin.skillsText([]), '')
+  })
+})
+
+describe('profileUpdateSummary', () => {
+  it('counts what landed and names what did not', () => {
+    const summary = plugin.profileUpdateSummary({
+      profiles: [{ name: 'default', ok: true }, { name: 'dev', ok: false }, { name: 'review', ok: true }]
+    })
+
+    assert.deepEqual(summary.failed, ['dev'])
+    assert.equal(summary.kind, 'warning')
+    assert.equal(summary.message, '2 von 3 Profilen aktualisiert · fehlgeschlagen: dev')
+  })
+
+  it('says a full success is one, and asks for the restart it needs', () => {
+    const summary = plugin.profileUpdateSummary({
+      profiles: [{ name: 'default', ok: true }],
+      restart_required: true
+    })
+
+    assert.equal(summary.kind, 'success')
+    assert.equal(summary.message, '1 von 1 Profil aktualisiert · Gateway neu starten, um die neue Version zu laden')
+  })
+
+  it('never invents profiles it was not told about', () => {
+    assert.equal(plugin.profileUpdateSummary(undefined).message, '0 von 0 Profilen aktualisiert')
+  })
+})
+
+describe('the folded lane’s label', () => {
+  it('starts at the top of the rail, not at half its height', () => {
+    // `writing-mode: vertical-rl` turns the inline axis vertical, so a
+    // <button>'s UA `text-align: center` centres the label DOWN the rail.
+    assert.deepEqual(plugin.RAIL_LABEL_STYLE, { textAlign: 'start', writingMode: 'vertical-rl' })
+  })
+})
