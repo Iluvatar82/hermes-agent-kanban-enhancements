@@ -2640,13 +2640,14 @@ function useBoardWrite(mutationFn, onDone) {
   })
 }
 
-/** Shared chrome for the board dialogs — same width, same Abbrechen/confirm pair. */
-function BoardDialog({ children, confirmLabel, disabled, onClose, onConfirm, open, title }) {
+/** Shared chrome for the board dialogs — same width, same Abbrechen/confirm pair.
+ *  `className` widens the one that carries more than a name (the settings). */
+function BoardDialog({ children, className, confirmLabel, disabled, onClose, onConfirm, open, title }) {
   return jsx(Dialog, {
     onOpenChange: next => !next && onClose(),
     open,
     children: jsxs(DialogContent, {
-      className: 'max-w-md',
+      className: cn('max-w-md', className),
       children: [
         jsx(DialogHeader, { children: jsx(DialogTitle, { children: title }) }),
         jsx('div', { className: 'flex flex-col gap-3', children }),
@@ -2791,6 +2792,7 @@ function BoardSettingsDialog({ board, onClose }) {
   const save = useBoardWrite(() => updateBoard(board?.slug ?? '', { project_id: project }), onClose)
 
   return jsxs(BoardDialog, {
+    className: 'max-w-lg',
     confirmLabel: 'Speichern',
     disabled: save.isPending,
     onClose,
@@ -2828,7 +2830,9 @@ function BoardSettingsSummary({ state }) {
 
   const current = boards?.boards?.find(meta => meta.slug === (slug || boards.current)) ?? null
   const effective = state?.effective_max_in_progress
-  const cap = effective == null ? 'unbegrenzt' : `max. ${effective} parallel`
+  // What the dispatcher will actually do, not what the config file says: an
+  // unset cap reads as the word, never as a blank.
+  const cap = effective == null ? 'unbegrenzt' : String(effective)
   const model = modelLabel({ model: state?.model, provider: state?.provider }, MODEL_INHERIT)
 
   return jsxs(Fragment, {
@@ -2843,17 +2847,17 @@ function BoardSettingsSummary({ state }) {
           variant: 'ghost',
           children: [
             jsx(Codicon, { className: 'shrink-0 text-(--ui-text-tertiary)', name: 'settings-gear', size: '0.8rem' }),
-            jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Runs' }),
-            jsx('span', { className: 'tabular-nums text-(--ui-text-secondary)', children: cap }),
-            jsx('span', { className: 'text-(--ui-text-quaternary)', children: '·' }),
-            jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Modell' }),
+            jsx('span', { className: 'shrink-0 text-(--ui-text-tertiary)', children: 'Parallel' }),
+            jsx('span', { className: 'shrink-0 tabular-nums text-(--ui-text-secondary)', children: cap }),
+            jsx('span', { className: 'shrink-0 text-(--ui-text-quaternary)', children: '·' }),
+            jsx('span', { className: 'shrink-0 text-(--ui-text-tertiary)', children: 'Modell' }),
             jsx('span', { className: 'min-w-0 truncate text-(--ui-text-secondary)', title: model, children: model })
           ]
         })
       }),
-      // Mounted only while open: the dialog reads board state, and an unopened
-      // settings sheet has no business polling for it.
-      open && current ? jsx(BoardSettingsDialog, { board: current, onClose: () => setOpen(false) }) : null
+      // Mounted, but handed a board only while open — the dialog's own queries
+      // hang off that, so a closed settings sheet asks for nothing.
+      jsx(BoardSettingsDialog, { board: open ? current : null, onClose: () => setOpen(false) })
     ]
   })
 }
@@ -4353,6 +4357,9 @@ function TaskSkillsField({ disabled, onPatch, task }) {
 
   return jsx(Input, {
     'aria-label': 'Skills dieses Tasks',
+    // `size: 'xs'` and the height the model trigger beside it has: the meta
+    // table is two tight columns, and a default-sized field would tower over
+    // every other row in it.
     className: 'h-6 min-w-0 text-[0.71rem]',
     disabled,
     onBlur: commit,
@@ -4364,6 +4371,7 @@ function TaskSkillsField({ disabled, onPatch, task }) {
       }
     },
     placeholder: 'keine',
+    size: 'xs',
     title: 'Komma-getrennt, z. B. `python, review`. Gilt ab dem nächsten Run.',
     value: text
   })
