@@ -8,9 +8,13 @@
  *
  * What it adds on top of core Kanban:
  *   · a `/kanban-plus` page — the board switcher, the lanes with drag & drop,
- *     a card menu and a per-lane add, board stop/start, a parallel-run cap, a
- *     board-wide model, and a task view (core's drawer, plus a worker context
- *     meter and a worker log that can take over the page)
+ *     a card menu and a per-lane add, board stop/start, and a task view
+ *     (core's drawer, plus editable skills, a worker context meter and a
+ *     worker log that can take over the page — where the CLI's own frames,
+ *     inline diffs and exit line are drawn rather than left as padding)
+ *   · the board's settings — the parallel-run cap and the board-wide model —
+ *     behind Board-Einstellungen, with a read-only line of them on the page
+ *   · one update button for this profile, and one for every profile at once
  *   · a statusbar pill with a small stop/start menu
  *   · three command-palette rows
  *   · a 3px context-fill strip above the composer
@@ -267,8 +271,23 @@ const createTask = body => api(withBoard('/tasks'), { method: 'POST', body })
 // The board directory itself. `ctx.rest` cannot leave this plugin's namespace,
 // so these mirror core's own `/boards` endpoints rather than borrowing them.
 const VERSION_KEY = ['kanban-plus', 'version']
+const PROFILES_KEY = ['kanban-plus', 'profiles']
 const fetchVersion = (check = true) => api(`/version?check=${check ? 'true' : 'false'}`)
-const runUpdate = ref => api('/update', { method: 'POST', body: ref ? { ref } : {} })
+const fetchProfiles = () => api('/profiles')
+
+/** An install is a git clone, and the desktop's REST door gives a request 30
+ *  seconds by default — less than one clone on a cold disk, and nowhere near a
+ *  clone per profile. Both budgets are generous on purpose: a timeout here
+ *  does not stop the install, it only loses the answer. */
+const UPDATE_TIMEOUT_MS = 5 * 60_000
+const ALL_PROFILES_TIMEOUT_MS = 20 * 60_000
+
+const runUpdate = ({ allProfiles = false, ref = '' } = {}) =>
+  api('/update', {
+    body: { ...(ref ? { ref } : {}), ...(allProfiles ? { all_profiles: true } : {}) },
+    method: 'POST',
+    timeoutMs: allProfiles ? ALL_PROFILES_TIMEOUT_MS : UPDATE_TIMEOUT_MS
+  })
 
 const fetchBoards = () => api('/boards')
 const fetchProjects = () => api('/projects')
@@ -431,6 +450,182 @@ export function buildLogRows(content) {
   }
 
   return rows
+}
+
+// ── what the full log's lines ARE ────────────────────────────────────────────
+// A worker log is a terminal transcript, and the CLI drew into it: a response
+// comes framed (`╭─ ☤ Hermes 15:28────╮` … `╰────╯`), an inline edit comes as a
+// unified diff after a `┊ review diff` marker, and the run ends with
+// `[kanban-worker-exit] rc=0`. All of it is plain text padded to the width of
+// whatever terminal the worker had — so a 100-column frame in a 60-column
+// panel wraps into confetti, and in a 200-column one it stops halfway.
+//
+// These three functions READ that structure and the components below DRAW it,
+// which is the whole trick: the rules become dividers that are as wide as the
+// log is, the diff gets the gutter it deserves, and the end of a run is
+// visible from across the room. Pure and separate, so what counts as a frame
+// is assertable without a DOM.
+
+/** Horizontal rule characters, and the corners a CLI frame opens/closes with. */
+const RULE_RUN_RE = /[─━═]{4,}/
+const RULE_TOP_RE = /^[╭┌╒╓╔]/
+const RULE_BOTTOM_RE = /^[╰└╘╙╚]/
+const BARE_RULE_RE = /^[─━═]{8,}$/
+/** Everything that is frame rather than label, from either end of a top rule. */
+const RULE_TRIM_RE = /^[╭┌╒╓╔╰└╘╙╚─━═\s]+|[─━═╮┐╕╖╗╯┘╛╜╝\s]+$/g
+
+/**
+ * A frame line as `{ edge, label }`, or `null` for an ordinary line.
+ *
+ * `top` opens a box and usually carries its title, `bottom` closes one, and
+ * `plain` is a bare rule the CLI prints between sections. The label is what
+ * survives after the box drawing is stripped off both ends.
+ */
+export function classifyLogRule(text) {
+  const line = String(text ?? '').trim()
+
+  if (!line) {
+    return null
+  }
+
+  if (BARE_RULE_RE.test(line)) {
+    return { edge: 'plain', label: '' }
+  }
+
+  // A run of rule characters is what makes it a frame and not a line of prose
+  // that happens to start with a box-drawing glyph.
+  if (!RULE_RUN_RE.test(line)) {
+    return null
+  }
+
+  if (RULE_TOP_RE.test(line)) {
+    return { edge: 'top', label: line.replace(RULE_TRIM_RE, '').trim() }
+  }
+
+  if (RULE_BOTTOM_RE.test(line)) {
+    return { edge: 'bottom', label: line.replace(RULE_TRIM_RE, '').trim() }
+  }
+
+  return null
+}
+
+/** The line the CLI writes before an inline diff (`  ┊ review diff`). */
+const DIFF_MARKER_RE = /^\s*[┊│|]?\s*review diff\s*$/
+/** A tool line's gutter — never part of the diff that ran before it. */
+const TOOL_GUTTER_RE = /^\s*[┊│]/
+const DIFF_FILE_RE = /^[ab]\/.* → /
+const DIFF_OMITTED_RE = /^\s*(?:…|\.\.\.)\s*omitted\b/
+
+/**
+ * Which kind of diff line this is, or `null` when it is not one at all.
+ *
+ * Only ever asked about lines INSIDE a diff run (see `decorateLogRows`): on
+ * its own, "starts with a minus" describes a bullet point as readily as a
+ * removed line. The `null` is what ends the run — including for the tool
+ * gutter, which is the first thing printed after a diff and must not be eaten
+ * by it just because it starts with a space.
+ */
+export function diffTone(text) {
+  const line = String(text ?? '')
+
+  if (!line || TOOL_GUTTER_RE.test(line)) {
+    return null
+  }
+
+  if (line.startsWith('@@') || DIFF_OMITTED_RE.test(line)) {
+    return 'hunk'
+  }
+
+  if (line.startsWith('+')) {
+    return 'plus'
+  }
+
+  if (line.startsWith('-')) {
+    return 'minus'
+  }
+
+  if (DIFF_FILE_RE.test(line)) {
+    return 'file'
+  }
+
+  return line.startsWith(' ') ? 'context' : null
+}
+
+/** `[kanban-worker-exit] rc=0` — the last line a kanban worker writes, and the
+ *  only witness in the file that the run ended rather than stopped. */
+const WORKER_EXIT_RE = /^\s*\[kanban-worker-exit\]\s*rc=(-?\d+)/
+
+export function workerExitCode(text) {
+  const match = WORKER_EXIT_RE.exec(String(text ?? ''))
+
+  return match ? Number(match[1]) : null
+}
+
+/**
+ * Tell every row of `buildLogRows` what it is part of: the frame it sits
+ * inside, the diff run it belongs to, the rule that opens or closes a block,
+ * and the line that ends the run.
+ *
+ * One pass, no lookahead — a frame whose opening rule fell off the top of the
+ * tail simply has no framed rows, which is exactly what it looks like in a
+ * terminal too.
+ */
+export function decorateLogRows(rows) {
+  const out = []
+  let framed = false
+  let inDiff = false
+
+  for (const row of rows ?? []) {
+    if (row.kind !== 'line') {
+      // A day divider can fall inside a frame; it says nothing about it.
+      out.push(row)
+
+      continue
+    }
+
+    const rule = classifyLogRule(row.text)
+
+    if (rule) {
+      inDiff = false
+      framed = rule.edge === 'top'
+      out.push({ ...row, edge: rule.edge, kind: 'rule', label: rule.label })
+
+      continue
+    }
+
+    const code = workerExitCode(row.text)
+
+    if (code !== null) {
+      framed = false
+      inDiff = false
+      out.push({ ...row, code, kind: 'exit' })
+
+      continue
+    }
+
+    if (DIFF_MARKER_RE.test(row.text)) {
+      inDiff = true
+      out.push({ ...row, framed, kind: 'diff', tone: 'marker' })
+
+      continue
+    }
+
+    if (inDiff) {
+      const tone = diffTone(row.text)
+
+      if (tone) {
+        out.push({ ...row, framed, kind: 'diff', tone })
+
+        continue
+      }
+
+      inDiff = false
+    }
+
+    out.push(framed ? { ...row, framed: true } : row)
+  }
+
+  return out
 }
 
 const BYTE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
@@ -702,8 +897,56 @@ const OPEN_DELAY_MS = 180
 /** Grace period so the pointer can travel from the strip into the popover. */
 const CLOSE_DELAY_MS = 160
 
-/** The hover card: one row per category, label left, token count right. */
-function BreakdownList({ categories, header }) {
+/**
+ * The breakdown card's width, and the one number that has to agree with the
+ * `w-56` below: centring the card on the pointer means knowing how wide it is.
+ * 14rem of content plus the popover's own `p-2` on both sides.
+ */
+const BREAKDOWN_WIDTH_PX = 240
+
+/**
+ * Where the breakdown card sits when the pointer decides: how far its CENTRE
+ * has to move from the meter's left edge, as Radix's `alignOffset` on a
+ * `start`-aligned popover.
+ *
+ * Pure, because "under the mouse" is the whole feature and a meter that spans
+ * a window is a long way from a card pinned to one of its ends. Radix keeps
+ * the result inside the viewport on its own, so this never clamps.
+ */
+export function anchorOffset({ left, pointerX, width = BREAKDOWN_WIDTH_PX }) {
+  if (!Number.isFinite(pointerX) || !Number.isFinite(left)) {
+    return null
+  }
+
+  return Math.round(pointerX - left - width / 2)
+}
+
+/** The card's bottom line: the whole window in one row, because that is the
+ *  number the categories above it add up to — and the one a reader came for. */
+function BreakdownTotal({ color, max, percent, used }) {
+  return jsxs('div', {
+    className:
+      'mt-0.5 flex items-center gap-1.5 border-t border-(--ui-stroke-tertiary) pt-1.5 text-[0.6875rem]',
+    children: [
+      jsx('span', { className: 'min-w-0 flex-1 text-(--ui-text-secondary)', children: 'Gesamt' }),
+      jsx('span', {
+        className: 'shrink-0 tabular-nums text-(--ui-text-quaternary)',
+        children: `${compactNumber(used)}/${compactNumber(max)}`
+      }),
+      jsx('span', {
+        // Tinted only when the window is getting tight: a calm meter's total
+        // is a fact, not a warning.
+        className: 'shrink-0 font-medium tabular-nums text-(--ui-text-secondary)',
+        style: color ? { color } : undefined,
+        children: `${percent}%`
+      })
+    ]
+  })
+}
+
+/** The hover card: one row per category, label left, token count right, and
+ *  the window's own total under them. */
+function BreakdownList({ categories, header, total }) {
   return jsxs('div', {
     className: 'flex w-56 flex-col gap-1',
     children: [
@@ -735,7 +978,8 @@ function BreakdownList({ categories, header }) {
                 category.id ?? category.label
               )
             )
-          })
+          }),
+      total ? jsx(BreakdownTotal, total) : null
     ]
   })
 }
@@ -756,7 +1000,13 @@ const METER_BAR_STYLE = { height: METER_HEIGHT }
  */
 function ContextBar({ align = 'end', className, header, showLabel = true, side = 'top', snapshot }) {
   const [open, setOpen] = useState(false)
+  // Where the card opens: an offset from the meter's left edge, or null until
+  // a pointer has been over it (a keyboard or touch open falls back to the
+  // caller's alignment).
+  const [offset, setOffset] = useState(null)
   const timer = useRef(null)
+  const triggerRef = useRef(null)
+  const pointerRef = useRef(null)
 
   useEffect(
     () => () => {
@@ -797,7 +1047,21 @@ function ContextBar({ align = 'end', className, header, showLabel = true, side =
       clearTimeout(timer.current)
     }
 
-    timer.current = setTimeout(() => setOpen(next), delay)
+    timer.current = setTimeout(() => {
+      if (next) {
+        // Pinned at OPENING time, not followed: a card that slides along with
+        // the pointer is a card nobody can read, and the reader is on their
+        // way into it anyway.
+        setOffset(
+          anchorOffset({
+            left: triggerRef.current?.getBoundingClientRect?.().left,
+            pointerX: pointerRef.current
+          })
+        )
+      }
+
+      setOpen(next)
+    }, delay)
   }
 
   const tone = meterTone(percent)
@@ -843,28 +1107,43 @@ function ContextBar({ align = 'end', className, header, showLabel = true, side =
           'data-slot': 'kanban-plus-context-bar',
           onPointerEnter: () => schedule(true, OPEN_DELAY_MS),
           onPointerLeave: () => schedule(false, CLOSE_DELAY_MS),
+          // Cheap and constant: a ref write per move, never a render.
+          onPointerMove: event => {
+            pointerRef.current = event.clientX
+          },
+          ref: triggerRef,
           role: 'meter',
           children: [
             bar,
-            showLabel
-              ? jsx('span', {
-                  className: 'shrink-0 text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
-                  style: tone === 'normal' ? undefined : { color },
-                  children: label
-                })
-              : null
+            // The full readout where there is room for it, and the percentage
+            // alone where there is not — a strip of color with no number on it
+            // is a mood, not a gauge. The card has both either way.
+            jsx('span', {
+              className: 'shrink-0 text-[0.625rem] tabular-nums text-(--ui-text-quaternary)',
+              style: tone === 'normal' ? undefined : { color },
+              title: label,
+              children: showLabel ? label : `${percent}%`
+            })
           ]
         })
       }),
       jsx(PopoverContent, {
-        align,
+        // Under the pointer when there was one: `start` plus the offset that
+        // puts the card's centre where the mouse stopped. Radix shifts it back
+        // inside the viewport at the edges, so both ends of a wide meter work.
+        align: offset === null ? align : 'start',
+        alignOffset: offset ?? undefined,
         className: 'w-auto',
         onCloseAutoFocus: event => event.preventDefault(),
         onOpenAutoFocus: event => event.preventDefault(),
         onPointerEnter: () => schedule(true, 0),
         onPointerLeave: () => schedule(false, CLOSE_DELAY_MS),
         side,
-        children: jsx(BreakdownList, { categories, header })
+        children: jsx(BreakdownList, {
+          categories,
+          header,
+          total: { color: tone === 'normal' ? null : color, max, percent, used }
+        })
       })
     ]
   })
@@ -917,23 +1196,127 @@ function TaskContextMeter({ running, taskId }) {
 // day dividers, filling the page until Esc (or the button) gives the details
 // back.
 
+/** The tint a framed block gets, inline for the reason in the file header. A
+ *  wash rather than a border: the rules above and below already draw the box,
+ *  and this only says which lines are inside it. */
+const FRAMED_ROW_STYLE = { background: 'color-mix(in srgb, var(--ui-bg-quaternary) 45%, transparent)' }
+
+/** The write-time gutter — the same cell for every kind of row, so the whole
+ *  log keeps one baseline grid however its lines are drawn. */
+function LogGutter({ row }) {
+  if (!row.iso) {
+    return jsx('span', { 'aria-hidden': 'true', className: 'select-none', style: row.framed ? FRAMED_ROW_STYLE : undefined })
+  }
+
+  return jsx('time', {
+    // `select-none` keeps the gutter out of a copy, so the clipboard gets the
+    // plain log and not a column of timestamps.
+    className: cn(
+      'pr-3 text-right text-[0.6875rem] tabular-nums text-(--ui-text-quaternary) select-none',
+      row.repeat && 'opacity-45'
+    ),
+    dateTime: row.iso,
+    style: row.framed ? FRAMED_ROW_STYLE : undefined,
+    title: row.title,
+    children: row.time
+  })
+}
+
 const LogLine = memo(function LogLine({ row }) {
   return jsxs(Fragment, {
     children: [
-      row.iso
-        ? jsx('time', {
-            // `select-none` keeps the gutter out of a copy, so the clipboard
-            // gets the plain log and not a column of timestamps.
-            className: cn(
-              'pr-3 text-right text-[0.6875rem] tabular-nums text-(--ui-text-quaternary) select-none',
-              row.repeat && 'opacity-45'
-            ),
-            dateTime: row.iso,
-            title: row.title,
-            children: row.time
-          })
-        : jsx('span', { 'aria-hidden': 'true', className: 'select-none' }),
-      jsx('span', { className: 'min-w-0 break-words whitespace-pre-wrap', children: row.text || ' ' })
+      jsx(LogGutter, { row }),
+      jsx('span', {
+        className: 'min-w-0 break-words whitespace-pre-wrap',
+        style: row.framed ? FRAMED_ROW_STYLE : undefined,
+        children: row.text || ' '
+      })
+    ]
+  })
+})
+
+/**
+ * A frame rule, redrawn at the width of the panel.
+ *
+ * The file has `╭─ ☤ Hermes 15:28──────────╮` padded to the width of the
+ * terminal the worker ran in, which is never the width of this view — too long
+ * and it wraps into a second line of dashes, too short and the box stops in
+ * mid-air. So the drawing is thrown away and only the TITLE is kept: a hairline
+ * that fills whatever room there is, and re-fills it when the window changes.
+ *
+ * It spans both columns, timestamp included — a divider with a clock on it is
+ * just a line that starts late, and the lines it frames carry their own.
+ */
+const LogRuleRow = memo(function LogRuleRow({ row }) {
+  return jsxs('div', {
+    className: cn(
+      'col-span-2 flex items-center gap-2 text-[0.6875rem] text-(--ui-text-quaternary) select-none',
+      row.edge === 'top' ? 'mt-1.5' : 'mb-1.5'
+    ),
+    role: 'separator',
+    children: [
+      row.label
+        ? jsx('span', { className: 'shrink-0 font-medium text-(--ui-text-tertiary)', children: row.label })
+        : null,
+      jsx('span', { className: 'h-px min-w-0 flex-1 bg-(--ui-stroke-tertiary)' })
+    ]
+  })
+})
+
+/** The diff colours: what a terminal would have coloured, in the app's tones.
+ *  `plus` is the green the running lane uses, `minus` the destructive red. */
+const DIFF_TONE_STYLE = {
+  context: { color: 'var(--ui-text-quaternary)' },
+  file: { color: 'var(--ui-text-tertiary)' },
+  hunk: { color: 'var(--ui-text-quaternary)' },
+  marker: { color: 'var(--ui-text-quaternary)' },
+  minus: { color: 'var(--color-destructive, #e5484d)' },
+  plus: { color: '#34d399' }
+}
+
+/**
+ * One line of an inline diff: indented behind a rail, `+` green and `-` red.
+ *
+ * The CLI ships the diff with its colours as ANSI, which this view strips —
+ * leaving a wall of monospace in which a removed line and an added one look
+ * identical. The rail is the same idea as the terminal gutter the tool lines
+ * have: it says "this block is a quotation, not the worker talking".
+ */
+const LogDiffLine = memo(function LogDiffLine({ row }) {
+  return jsxs(Fragment, {
+    children: [
+      jsx(LogGutter, { row }),
+      jsx('span', {
+        className: 'min-w-0 border-l-2 border-(--ui-stroke-tertiary) pl-2 break-words whitespace-pre-wrap',
+        style: DIFF_TONE_STYLE[row.tone] ?? DIFF_TONE_STYLE.context,
+        children: row.text || ' '
+      })
+    ]
+  })
+})
+
+/** Green for a clean exit, the destructive red for anything else. */
+const EXIT_STYLE = { color: '#34d399' }
+const EXIT_FAILED_STYLE = { color: 'var(--color-destructive, #e5484d)' }
+
+/**
+ * The end of the run, drawn as an end.
+ *
+ * `[kanban-worker-exit] rc=0` is the last line the worker writes and it used to
+ * scroll past as one more grey line among thousands — the one line in the file
+ * that answers "is it done, and did it work".
+ */
+const LogExitRow = memo(function LogExitRow({ row }) {
+  const ok = row.code === 0
+  const style = ok ? EXIT_STYLE : EXIT_FAILED_STYLE
+
+  return jsxs('div', {
+    className: 'col-span-2 mt-1.5 flex items-center gap-1.5 text-[0.6875rem] font-medium select-none',
+    style,
+    children: [
+      jsx(Codicon, { name: ok ? 'pass' : 'error', size: '0.8rem' }),
+      ok ? 'Ausführung beendet' : `Ausführung beendet · rc=${row.code}`,
+      jsx('span', { className: 'h-px min-w-0 flex-1 bg-current opacity-30' })
     ]
   })
 })
@@ -1003,10 +1386,15 @@ function PlainLog({ text }) {
 
 /**
  * The full view: a two-column timeline — write time left, text right, a divider
- * whenever the local date turns over.
+ * whenever the local date turns over, and the transcript's own structure
+ * (`decorateLogRows`) drawn rather than left as terminal padding.
+ *
+ * One grid for the whole log, never a grid per block: the timestamp column is
+ * sized by its content, so a block with its own grid would line its gutter up
+ * with nothing. Everything that spans the width says so with `col-span-2`.
  */
 function TimestampedLog({ content }) {
-  const rows = useMemo(() => buildLogRows(content), [content])
+  const rows = useMemo(() => decorateLogRows(buildLogRows(content)), [content])
 
   if (!rows.length) {
     return jsx('div', { className: 'font-mono text-[0.75rem] text-(--ui-text-quaternary)', children: '—' })
@@ -1016,24 +1404,38 @@ function TimestampedLog({ content }) {
     className: 'grid grid-cols-[auto_minmax(0,1fr)] font-mono text-[0.75rem] text-(--ui-text-tertiary)',
     'data-selectable-text': 'true',
     style: FULL_LOG_STYLE,
-    children: rows.map((row, index) =>
-      row.kind === 'day'
-        ? jsxs(
-            'div',
-            {
-              className:
-                'col-span-2 my-1.5 flex items-center gap-2 text-[0.625rem] font-medium text-(--ui-text-quaternary) select-none first:mt-0',
-              role: 'separator',
-              children: [
-                jsx('span', { className: 'h-px flex-1 bg-(--ui-stroke-tertiary)' }),
-                row.label,
-                jsx('span', { className: 'h-px flex-1 bg-(--ui-stroke-tertiary)' })
-              ]
-            },
-            `day-${index}`
-          )
-        : jsx(LogLine, { row }, index)
-    )
+    children: rows.map((row, index) => {
+      if (row.kind === 'day') {
+        return jsxs(
+          'div',
+          {
+            className:
+              'col-span-2 my-1.5 flex items-center gap-2 text-[0.625rem] font-medium text-(--ui-text-quaternary) select-none first:mt-0',
+            role: 'separator',
+            children: [
+              jsx('span', { className: 'h-px flex-1 bg-(--ui-stroke-tertiary)' }),
+              row.label,
+              jsx('span', { className: 'h-px flex-1 bg-(--ui-stroke-tertiary)' })
+            ]
+          },
+          `day-${index}`
+        )
+      }
+
+      if (row.kind === 'rule') {
+        return jsx(LogRuleRow, { row }, index)
+      }
+
+      if (row.kind === 'exit') {
+        return jsx(LogExitRow, { row }, index)
+      }
+
+      if (row.kind === 'diff') {
+        return jsx(LogDiffLine, { row }, index)
+      }
+
+      return jsx(LogLine, { row }, index)
+    })
   })
 }
 
@@ -1809,10 +2211,146 @@ function ModelPatchWarning({ state }) {
   return jsx(WarningRow, { children: message })
 }
 
+/**
+ * What a profile-wide update did, in one line.
+ *
+ * Pure, because "did it work" is the one thing a reader relies on here and a
+ * partial success is the interesting case: eight profiles updated and one
+ * refused is NOT a success, and the one that refused has to be named.
+ */
+export function profileUpdateSummary(result) {
+  const rows = Array.isArray(result?.profiles) ? result.profiles : []
+  const failed = rows.filter(row => !row?.ok).map(row => String(row?.name ?? '?'))
+  const done = rows.length - failed.length
+  const parts = [`${done} von ${rows.length} ${rows.length === 1 ? 'Profil' : 'Profilen'} aktualisiert`]
+
+  if (failed.length > 0) {
+    parts.push(`fehlgeschlagen: ${failed.join(', ')}`)
+  } else if (result?.restart_required) {
+    parts.push('Gateway neu starten, um die neue Version zu laden')
+  }
+
+  return { failed, kind: failed.length > 0 ? 'warning' : 'success', message: parts.join(' · ') }
+}
+
+/** The profiles on this machine and what each has installed. One manifest read
+ *  per profile on the backend, so it is fetched with the row rather than
+ *  behind the click that needs it. */
+function useProfiles() {
+  return useQuery({ queryFn: fetchProfiles, queryKey: PROFILES_KEY, retry: false, staleTime: 5 * 60_000 })
+}
+
+/** One profile in the confirmation: which it is, and what version it carries. */
+function ProfileVersionRow({ profile }) {
+  const installed = String(profile?.installed ?? '').trim()
+
+  return jsxs('div', {
+    className: 'flex items-center gap-2 text-[0.75rem]',
+    children: [
+      jsx('span', {
+        className: 'min-w-0 flex-1 truncate text-(--ui-text-secondary)',
+        title: profile?.home,
+        children: profile?.name
+      }),
+      profile?.current
+        ? jsx('span', { className: 'shrink-0 text-[0.625rem] text-(--ui-text-quaternary)', children: 'dieser Gateway' })
+        : null,
+      jsx('span', {
+        className: 'shrink-0 tabular-nums text-(--ui-text-tertiary)',
+        // No copy there yet: this profile gets one, which is the point of
+        // updating all of them rather than only the ones that already work.
+        children: installed || 'nicht installiert'
+      })
+    ]
+  })
+}
+
+/**
+ * Updating every profile, from the page.
+ *
+ * This plugin is installed per Hermes home: the gateway's profile runs the
+ * dispatcher, and every profile that runs kanban workers needs its own copy
+ * for the log timestamps and the context snapshots. The button beside it
+ * updates exactly one of them — which is why `scripts/update.ps1` exists, and
+ * why this is here: the same thing, without the shell.
+ *
+ * It renders nothing when there is nothing to offer (one profile, or a Hermes
+ * that cannot be pointed at another profile's home) — the single-profile
+ * button is then the whole truth.
+ */
+function ProfileUpdateAction({ onRun, pending }) {
+  const { data } = useProfiles()
+  const [confirming, setConfirming] = useState(false)
+  const profiles = data?.profiles ?? []
+
+  if (!data?.supported || profiles.length < 2) {
+    return null
+  }
+
+  return jsxs(Fragment, {
+    children: [
+      jsx(Tip, {
+        label: `Kanban+ in allen ${profiles.length} Profilen installieren`,
+        children: jsxs(Button, {
+          disabled: pending,
+          onClick: () => setConfirming(true),
+          size: 'xs',
+          variant: 'ghost',
+          children: [
+            // `layers` is the glyph Hermes' own profile switcher uses for
+            // "all profiles" — the same idea, and an icon this app ships.
+            jsx(Codicon, { name: pending ? 'sync' : 'layers', size: '0.75rem', spinning: pending }),
+            `Alle Profile (${profiles.length})`
+          ]
+        })
+      }),
+      jsx(Dialog, {
+        onOpenChange: next => !next && setConfirming(false),
+        open: confirming,
+        children: jsxs(DialogContent, {
+          className: 'max-w-md',
+          children: [
+            jsx(DialogHeader, { children: jsx(DialogTitle, { children: 'Alle Profile aktualisieren?' }) }),
+            jsxs('div', {
+              className: 'flex flex-col gap-2',
+              children: [
+                jsx('span', {
+                  className: 'text-[0.75rem] text-(--ui-text-secondary)',
+                  children:
+                    'Kanban+ wird in jedes dieser Profile installiert — auch in die, die es noch nicht haben. ' +
+                    'Der Gateway lädt seine neue Version erst nach einem Neustart.'
+                }),
+                jsx('div', {
+                  className: 'flex flex-col gap-1 border-t border-(--ui-stroke-tertiary) pt-2',
+                  children: profiles.map(profile => jsx(ProfileVersionRow, { profile }, profile.name))
+                })
+              ]
+            }),
+            jsxs(DialogFooter, {
+              children: [
+                jsx(Button, { onClick: () => setConfirming(false), variant: 'text', children: 'Abbrechen' }),
+                jsx(Button, {
+                  disabled: pending,
+                  onClick: () => {
+                    setConfirming(false)
+                    onRun()
+                  },
+                  children: 'Alle aktualisieren'
+                })
+              ]
+            })
+          ]
+        })
+      })
+    ]
+  })
+}
+
 /** Update this plugin from its own source: what is running, what is out there,
  *  and one button that closes the gap. The install replaces the directory this
  *  page's backend was imported from, so the gateway keeps serving the old code
- *  until it restarts — the row says that instead of leaving it to be noticed. */
+ *  until it restarts — the row says that instead of leaving it to be noticed.
+ *  `ProfileUpdateAction` beside it does the same for every profile at once. */
 function PluginUpdateField() {
   const qc = useQueryClient()
   const [confirming, setConfirming] = useState(false)
@@ -1827,16 +2365,29 @@ function PluginUpdateField() {
   })
 
   const update = useMutation({
-    mutationFn: () => runUpdate(),
+    mutationFn: ({ allProfiles = false } = {}) => runUpdate({ allProfiles }),
     onError: err => host.notifyError(err, 'Update fehlgeschlagen'),
-    onSuccess: result =>
+    onSuccess: (result, variables) => {
+      if (variables?.allProfiles) {
+        const summary = profileUpdateSummary(result)
+
+        host.notify({ kind: summary.kind, message: summary.message })
+
+        return
+      }
+
       host.notify({
         kind: 'success',
         message: result?.restart_required
           ? `Kanban+ ${result.installed} installiert — Gateway neu starten, um es zu laden.`
           : `Kanban+ ${result?.installed ?? ''} installiert.`
-      }),
-    onSettled: () => void qc.invalidateQueries({ queryKey: VERSION_KEY })
+      })
+    },
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: VERSION_KEY })
+      // Every profile's installed version just moved (or was supposed to).
+      void qc.invalidateQueries({ queryKey: PROFILES_KEY })
+    }
   })
 
   const state = updateState(data)
@@ -1888,7 +2439,8 @@ function PluginUpdateField() {
             title: hint || undefined,
             children: versionLabel(data)
           }),
-          action
+          action,
+          jsx(ProfileUpdateAction, { onRun: () => update.mutate({ allProfiles: true }), pending: busy })
         ]
       }),
       jsx('span', {
@@ -1896,7 +2448,7 @@ function PluginUpdateField() {
         children:
           state === 'restart'
             ? 'Die neue Version liegt bereits auf der Platte; der Gateway lädt sie beim nächsten Start.'
-            : 'Aktualisiert nur dieses Profil. Für alle Profile: scripts/update.ps1.'
+            : 'Die Schaltfläche aktualisiert dieses Profil; „Alle Profile" installiert Kanban+ in jedes Profil.'
       }),
       jsx(ConfirmDialog, {
         confirmLabel: 'Aktualisieren',
@@ -2201,10 +2753,23 @@ function RenameBoardDialog({ board, onClose }) {
   })
 }
 
+/**
+ * Everything about the board that is a SETTING rather than a control.
+ *
+ * The parallel-run cap and the board model used to sit in a row above the
+ * lanes, where they were two live inputs between the reader and the board —
+ * a number field and a model catalog, both one stray click from changing how
+ * every worker on the board runs. They belong here, with the board's scope,
+ * behind a deliberate "Einstellungen…"; the page keeps a read-only line of
+ * what they are (`BoardSettingsSummary`).
+ *
+ * The two of them write immediately rather than on Speichern: each one is its
+ * own endpoint (`PUT /max-parallel`, `PUT /model`) and neither belongs to the
+ * board record this dialog's footer saves. The hint under them says so.
+ */
 function BoardSettingsDialog({ board, onClose }) {
+  const slug = useValue($boardSlug)
   const [project, setProject] = useState('')
-  // Null while closed — see RenameBoardDialog.
-  const slug = board?.slug ?? ''
 
   useEffect(() => {
     if (board) {
@@ -2212,18 +2777,84 @@ function BoardSettingsDialog({ board, onClose }) {
     }
   }, [board])
 
+  // The same cache entry the page reads, so the summary and this dialog can
+  // never disagree about what is set.
+  const { data: state } = useQuery({
+    enabled: Boolean(board),
+    queryFn: fetchState,
+    queryKey: stateKey(slug),
+    staleTime: 5_000
+  })
+
   // The name lives in the rename dialog; '' clears the scope, which also drops
   // the mirrored default_workdir on the backend.
-  const save = useBoardWrite(() => updateBoard(slug, { project_id: project }), onClose)
+  const save = useBoardWrite(() => updateBoard(board?.slug ?? '', { project_id: project }), onClose)
 
-  return jsx(BoardDialog, {
+  return jsxs(BoardDialog, {
     confirmLabel: 'Speichern',
     disabled: save.isPending,
     onClose,
     onConfirm: () => save.mutate(),
     open: Boolean(board),
     title: board ? `Board-Einstellungen — ${board.name || board.slug}` : 'Einstellungen…',
-    children: jsx(ProjectPicker, { onChange: setProject, value: project })
+    children: [
+      jsx(ProjectPicker, { onChange: setProject, value: project }),
+      jsxs('div', {
+        className: 'flex flex-col gap-3 border-t border-(--ui-stroke-tertiary) pt-3',
+        children: [
+          jsx(MaxParallelField, { state }),
+          jsx(BoardModelField, { state }),
+          jsx('span', {
+            className: 'text-[0.6875rem] text-(--ui-text-quaternary)',
+            children: 'Limit und Board-Modell werden sofort gespeichert — „Speichern" gilt für das Projekt.'
+          })
+        ]
+      })
+    ]
+  })
+}
+
+/**
+ * The two board settings on the page: what they are, and the way in.
+ *
+ * Read-only on purpose — see `BoardSettingsDialog`. It is one muted line, so
+ * the cap and the model stay glanceable without being one mis-click from
+ * changed.
+ */
+function BoardSettingsSummary({ state }) {
+  const slug = useValue($boardSlug)
+  const { data: boards } = useQuery({ queryFn: fetchBoards, queryKey: BOARDS_KEY, staleTime: 30_000 })
+  const [open, setOpen] = useState(false)
+
+  const current = boards?.boards?.find(meta => meta.slug === (slug || boards.current)) ?? null
+  const effective = state?.effective_max_in_progress
+  const cap = effective == null ? 'unbegrenzt' : `max. ${effective} parallel`
+  const model = modelLabel({ model: state?.model, provider: state?.provider }, MODEL_INHERIT)
+
+  return jsxs(Fragment, {
+    children: [
+      jsx(Tip, {
+        label: 'Board-Einstellungen öffnen',
+        children: jsxs(Button, {
+          className: 'h-7 min-w-0 gap-1.5 px-2 text-[0.75rem] font-normal',
+          disabled: !current,
+          onClick: () => setOpen(true),
+          size: 'sm',
+          variant: 'ghost',
+          children: [
+            jsx(Codicon, { className: 'shrink-0 text-(--ui-text-tertiary)', name: 'settings-gear', size: '0.8rem' }),
+            jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Runs' }),
+            jsx('span', { className: 'tabular-nums text-(--ui-text-secondary)', children: cap }),
+            jsx('span', { className: 'text-(--ui-text-quaternary)', children: '·' }),
+            jsx('span', { className: 'text-(--ui-text-tertiary)', children: 'Modell' }),
+            jsx('span', { className: 'min-w-0 truncate text-(--ui-text-secondary)', title: model, children: model })
+          ]
+        })
+      }),
+      // Mounted only while open: the dialog reads board state, and an unopened
+      // settings sheet has no business polling for it.
+      open && current ? jsx(BoardSettingsDialog, { board: current, onClose: () => setOpen(false) }) : null
+    ]
   })
 }
 
@@ -3093,7 +3724,18 @@ function BoardCard({ columns, now, onMove, onSelect, selected, task }) {
  *  dot and the sideways label, and no wider — the point is the space it gives
  *  back to the lanes that have cards. */
 const RAIL_STYLE = { width: '2.25rem' }
-const RAIL_LABEL_STYLE = { writingMode: 'vertical-rl' }
+
+/**
+ * The folded lane's sideways label — and the reason `textAlign` is in here.
+ *
+ * `writing-mode: vertical-rl` turns the INLINE axis vertical, so text-align
+ * stops meaning left/right and starts meaning top/bottom. The rail is a
+ * `<button>`, every browser gives a button `text-align: center`, and the label
+ * is stretched over the lane's full height — so the name of the lane sat at
+ * half height, floating in the middle of an otherwise empty rail. `start` puts
+ * it where a column header belongs: at the top, right under the lane's icon.
+ */
+export const RAIL_LABEL_STYLE = { textAlign: 'start', writingMode: 'vertical-rl' }
 
 function BoardColumn({ collapsed, column, columns, now, onAdd, onMove, onSelect, onToggle, selectedId }) {
   const [over, setOver] = useState(false)
@@ -3403,6 +4045,13 @@ export function eventLabel(event) {
       return { label: 'Archiviert' }
     case 'edited':
       return { label: 'Bearbeitet' }
+    // This plugin's own event (`task_skills.EVENT_KIND`): the skills edit core
+    // has no writer for, and therefore no label for either.
+    case 'skills_set': {
+      const skills = Array.isArray(payload.skills) ? payload.skills.filter(Boolean) : []
+
+      return { detail: skills.join(', ') || undefined, label: skills.length ? 'Skills geändert' : 'Skills entfernt' }
+    }
     case 'reprioritized':
       return { label: `Priorität auf ${payload.priority ?? '?'}` }
     default: {
@@ -3651,6 +4300,75 @@ function TaskModelField({ disabled, onPatch, task }) {
   })
 }
 
+/** The skills of a task as one line of text — the inverse of `parseSkills`, so
+ *  what the field shows round-trips through what the dialog parses. */
+export function skillsText(skills) {
+  return Array.isArray(skills) ? skills.filter(Boolean).join(', ') : ''
+}
+
+/**
+ * The task's skills, editable.
+ *
+ * The one field on this panel that does NOT go through core's kanban API:
+ * core sets `skills` when the task is created and has no way to change it
+ * afterwards, so a name typed wrong — or a skill that simply does not exist —
+ * used to mean deleting the task and writing it again. The backend's
+ * `task_skills` writer is what makes this row possible; the rules are core's
+ * own (no commas inside a name, no toolset names), and a refusal comes back as
+ * the message `kanban create --skills` would have printed.
+ *
+ * Local text until Enter or a blur, like the parallel-run cap: an edit is a
+ * decision, not a keystroke, and text that parses to what the server already
+ * has is not an edit at all.
+ */
+function TaskSkillsField({ disabled, onPatch, task }) {
+  const server = skillsText(task?.skills)
+  const [text, setText] = useState(server)
+  // What the last PATCH carried: Enter and the blur that follows it are two
+  // commits of the same value, and the server has not answered in between.
+  const sentRef = useRef(null)
+
+  // Follow the server whenever it moves, never while the user is mid-edit —
+  // the `server` dependency alone is what makes that difference.
+  useEffect(() => {
+    setText(server)
+    sentRef.current = null
+  }, [server])
+
+  const commit = () => {
+    const skills = parseSkills(text)
+    const next = skills.join(', ')
+
+    if (next === server || next === sentRef.current) {
+      // Unchanged — but the field still snaps back to the canonical spelling,
+      // so stray commas and spaces do not linger as if they were saved.
+      setText(server)
+
+      return
+    }
+
+    sentRef.current = next
+    onPatch({ skills })
+  }
+
+  return jsx(Input, {
+    'aria-label': 'Skills dieses Tasks',
+    className: 'h-6 min-w-0 text-[0.71rem]',
+    disabled,
+    onBlur: commit,
+    onChange: event => setText(event.target.value),
+    onKeyDown: event => {
+      if (event.key === 'Enter') {
+        event.preventDefault()
+        commit()
+      }
+    },
+    placeholder: 'keine',
+    title: 'Komma-getrennt, z. B. `python, review`. Gilt ab dem nächsten Run.',
+    value: text
+  })
+}
+
 /** The meta table's label column, inline for the reason in the file header:
  *  wide enough for "Abhängigkeiten" without wrapping every label. */
 const META_TABLE_STYLE = { gridTemplateColumns: '5.5rem minmax(0, 1fr)' }
@@ -3679,6 +4397,7 @@ function TaskMetaTable({ disabled, now, onPatch, task }) {
     style: META_TABLE_STYLE,
     children: [
       jsx(MetaRow, { label: 'Modell', children: jsx(TaskModelField, { disabled, onPatch, task }) }),
+      jsx(MetaRow, { label: 'Skills', children: jsx(TaskSkillsField, { disabled, onPatch, task }) }),
       ...rows
         .filter(([, value]) => Boolean(value))
         .map(([label, value]) => jsx(MetaRow, { label, title: value, children: value }, label))
@@ -4160,15 +4879,12 @@ function KanbanPlusPage() {
       }),
       jsx(GuardWarning, { state }),
       jsx(ModelPatchWarning, { state }),
-      // Both board settings share one row: side by side when there is room,
-      // stacked when the window is narrow.
+      // What the board is set to, and what version is running it. Both are
+      // read-outs with one way in — the cap and the model are edited in
+      // Board-Einstellungen, not between the header and the lanes.
       jsxs('div', {
         className: 'flex shrink-0 flex-wrap items-start gap-x-8 gap-y-2 px-4 py-2',
-        children: [
-          jsx(MaxParallelField, { state }),
-          jsx(BoardModelField, { state }),
-          jsx(PluginUpdateField, {})
-        ]
+        children: [jsx(BoardSettingsSummary, { state }), jsx(PluginUpdateField, {})]
       }),
       // The lanes own the whole width. The task drawer floats over them on the
       // right rather than taking a column of its own, so opening a card never
