@@ -223,6 +223,62 @@ describe('collapseCarriageReturns', () => {
   })
 })
 
+describe('run openings borrow the next stamp', () => {
+  const lines = content => plugin.buildLogRows(content).filter(row => row.kind === 'line')
+  const run = [
+    'Query: work kanban task t_1',
+    'Initializing agent...',
+    '[2026-09-17T08:00:05Z] preparing terminal',
+    '[2026-09-17T08:00:06Z] done'
+  ].join('\n')
+
+  it('gives the lines before the first stamp that stamp, marked as an estimate', () => {
+    const rows = lines(run)
+
+    assert.deepEqual(
+      rows.map(row => [row.text, row.iso, Boolean(row.approx)]),
+      [
+        ['Query: work kanban task t_1', '2026-09-17T08:00:05Z', true],
+        ['Initializing agent...', '2026-09-17T08:00:05Z', true],
+        ['preparing terminal', '2026-09-17T08:00:05Z', false],
+        ['done', '2026-09-17T08:00:06Z', false]
+      ]
+    )
+    assert.ok(rows[0].title.startsWith('≈'))
+    assert.equal(rows[0].time, rows[2].time)
+  })
+
+  it('never dims the real line as a repeat of its own estimate', () => {
+    assert.equal(lines(run)[2].repeat, false)
+  })
+
+  it('does not reach into the previous run', () => {
+    const log = ['old run line', '[kanban-worker-exit] rc=0', 'Query: work kanban task t_1', run.split('\n').slice(1).join('\n')].join('\n')
+    const rows = lines(log)
+
+    assert.equal(rows[0].iso, null)
+    assert.equal(rows[1].iso, null)
+    assert.equal(rows[2].approx, true)
+  })
+
+  it('stops at the run start even without an exit marker above it', () => {
+    const log = ['unstamped tail of an older run', 'Query: work kanban task t_2', '[2026-09-17T09:00:00Z] go'].join('\n')
+
+    assert.deepEqual(lines(log).map(row => row.iso), [null, '2026-09-17T09:00:00Z', '2026-09-17T09:00:00Z'])
+  })
+
+  it('borrows at most five lines back', () => {
+    const log = [...Array.from({ length: 8 }, (_, i) => `line ${i}`), '[2026-09-17T09:00:00Z] first stamp'].join('\n')
+    const borrowed = lines(log).filter(row => row.approx).length
+
+    assert.equal(borrowed, 5)
+  })
+
+  it('leaves an entirely unstamped (old) log blank', () => {
+    assert.ok(lines('Query: work kanban task t_3\nInitializing agent...\nsomething').every(row => row.iso === null))
+  })
+})
+
 describe('plainLogText', () => {
   it('drops the stamps, the ANSI and the carriage returns, keeps the lines', () => {
     const log = [
