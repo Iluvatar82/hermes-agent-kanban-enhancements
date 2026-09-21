@@ -249,14 +249,14 @@ const putBoardModel = (model, provider) => api(withBoard('/model'), { method: 'P
 // Two tails, because the two views want different things. The task drawer
 // wants a glance — core's own drawer asks for the same 16 KiB — and polls it
 // every three seconds; the overlay wants the archive and is opened on purpose.
-// Stamps ride along only where there is a gutter to put them in.
+// Both carry the write-time stamps: both draw the time gutter.
 const SMALL_LOG_TAIL = 16_384
 const FULL_LOG_TAIL = 1_048_576
 const fetchTaskLog = (id, full) =>
   api(
     withBoard(`/tasks/${encodeURIComponent(id)}/log`, {
       tail: String(full ? FULL_LOG_TAIL : SMALL_LOG_TAIL),
-      timestamps: full ? 'true' : 'false'
+      timestamps: 'true'
     })
   )
 const fetchTaskContext = id => api(withBoard(`/tasks/${encodeURIComponent(id)}/context`))
@@ -386,11 +386,54 @@ export function plainLogText(content) {
     .join('\n')
 }
 
+// A run's first lines are printed before the worker has loaded the plugin that
+// stamps them — `Query: work kanban task …`, `Initializing agent…` — so every
+// run opened with one to three blank gutter cells. Those lines borrow the time
+// of the first stamped line below them, marked as an estimate (`approx`), but
+// never across a run boundary and never more than a few lines back: an old,
+// entirely unstamped log keeps its empty gutter rather than a made-up time.
+const BACKFILL_MAX_LINES = 5
+const RUN_START_RE = /Query: work kanban task/
+const RUN_END_RE = /\[kanban-worker-exit\]/
+
+/** For each raw line, the ISO stamp it may borrow from below (or null). */
+export function borrowedStamps(lines) {
+  const borrowed = new Array(lines.length).fill(null)
+
+  for (let index = 0; index < lines.length; index++) {
+    const match = STAMP_RE.exec(lines[index])
+
+    if (!match) {
+      continue
+    }
+
+    for (let above = index - 1, steps = 0; above >= 0 && steps < BACKFILL_MAX_LINES; above--, steps++) {
+      const line = lines[above]
+
+      // A stamped line, one already filled, or the end of the previous run:
+      // everything above belongs to something else.
+      if (STAMP_RE.test(line) || borrowed[above] || RUN_END_RE.test(line)) {
+        break
+      }
+
+      borrowed[above] = match[1]
+
+      // The run starts here; nothing above it was written by this worker.
+      if (RUN_START_RE.test(line)) {
+        break
+      }
+    }
+  }
+
+  return borrowed
+}
+
 /**
  * Split a stamped log into display rows: one `{kind:'line'}` per line, plus a
  * `{kind:'day'}` divider whenever the LOCAL date changes. A line's carriage
- * returns collapse to what a terminal would show last (progress bars), and
- * unstamped lines keep an empty gutter instead of borrowing the previous time.
+ * returns collapse to what a terminal would show last (progress bars). A run's
+ * unstamped opening lines borrow the next stamp as an estimate (`approx`, see
+ * `borrowedStamps`); any other unstamped line keeps an empty gutter.
  */
 export function buildLogRows(content) {
   const lines = String(content ?? '').split('\n')
@@ -404,14 +447,16 @@ export function buildLogRows(content) {
   // One formatted label per distinct ISO stamp: a 1 MiB tail is tens of
   // thousands of lines but only a few thousand distinct seconds.
   const labels = new Map()
+  const borrowed = borrowedStamps(lines)
   let day = ''
   let lastIso = ''
 
-  for (const raw of lines) {
+  for (const [position, raw] of lines.entries()) {
     let line = raw
     const match = STAMP_RE.exec(line)
     let iso = null
     let at = null
+    let approx = false
 
     if (match) {
       line = line.slice(match[0].length)
@@ -420,6 +465,14 @@ export function buildLogRows(content) {
       if (!Number.isNaN(parsed.getTime())) {
         iso = match[1]
         at = parsed
+      }
+    } else if (borrowed[position]) {
+      const parsed = new Date(borrowed[position])
+
+      if (!Number.isNaN(parsed.getTime())) {
+        iso = borrowed[position]
+        at = parsed
+        approx = true
       }
     }
 
@@ -443,6 +496,22 @@ export function buildLogRows(content) {
     if (!label) {
       label = { time: timeFmt.format(at), title: fullFmt.format(at) }
       labels.set(iso, label)
+    }
+
+    if (approx) {
+      // An estimate never counts as "the same second again" for the real line
+      // below it, so that line keeps its full-strength time.
+      rows.push({
+        approx: true,
+        iso,
+        kind: 'line',
+        repeat: false,
+        text,
+        time: label.time,
+        title: `≈ ${label.title} — geschätzt: geschrieben, bevor der Worker die Zeitstempel aktiviert hat`
+      })
+
+      continue
     }
 
     rows.push({ iso, kind: 'line', repeat: iso === lastIso, text, time: label.time, title: label.title })
@@ -1188,13 +1257,14 @@ function TaskContextMeter({ running, taskId }) {
 }
 
 // ── worker log ───────────────────────────────────────────────────────────────
-// Two views of the same file, and they fetch differently on purpose. The task
-// view carries the SMALL one: core's own 16 KiB tail, unstamped, rendered as
-// ONE block of wrapped text — a glance at what the worker is doing, cheap
-// enough to poll every three seconds. The four-arrow button in its header swaps
-// it for the FULL one: a megabyte of tail with the write-time gutter and the
-// day dividers, filling the page until Esc (or the button) gives the details
-// back.
+// Two views of the same file. The task view carries the SMALL one: core's own
+// 16 KiB tail — a glance at what the worker is doing, cheap enough to poll every
+// three seconds. The four-arrow button in its header swaps it for the FULL one:
+// a megabyte of tail, filling the page until Esc (or the button) gives the
+// details back. Both draw the same timeline — write-time gutter, day dividers,
+// the transcript's frames — so a line reads the same wherever it is seen; the
+// small one only sets it a notch smaller. 16 KiB is a few hundred rows, well
+// inside what a node per line costs.
 
 /** The tint a framed block gets, inline for the reason in the file header. A
  *  wash rather than a border: the rules above and below already draw the box,
@@ -1213,7 +1283,8 @@ function LogGutter({ row }) {
     // plain log and not a column of timestamps.
     className: cn(
       'pr-3 text-right text-[0.6875rem] tabular-nums text-(--ui-text-quaternary) select-none',
-      row.repeat && 'opacity-45'
+      row.repeat && 'opacity-45',
+      row.approx && 'italic opacity-60'
     ),
     dateTime: row.iso,
     style: row.framed ? FRAMED_ROW_STYLE : undefined,
@@ -1367,24 +1438,6 @@ const SMALL_LOG_STYLE = { maxHeight: '20rem', minHeight: '200px' }
 const FULL_LOG_STYLE = { lineHeight: 1.6 }
 
 /**
- * The small view: the tail as one wrapped block of monospace text, which is
- * exactly what core's task drawer does with it. No gutter, no dividers and no
- * node per line — the four-arrow button is one click away for all three.
- */
-function PlainLog({ text }) {
-  if (!text.trim()) {
-    return jsx('div', { className: 'font-mono text-[0.75rem] text-(--ui-text-quaternary)', children: '—' })
-  }
-
-  return jsx('div', {
-    className:
-      'font-mono text-[0.6875rem] leading-[1.55] break-words whitespace-pre-wrap text-(--ui-text-tertiary)',
-    'data-selectable-text': 'true',
-    children: text
-  })
-}
-
-/**
  * The full view: a two-column timeline — write time left, text right, a divider
  * whenever the local date turns over, and the transcript's own structure
  * (`decorateLogRows`) drawn rather than left as terminal padding.
@@ -1393,7 +1446,7 @@ function PlainLog({ text }) {
  * sized by its content, so a block with its own grid would line its gutter up
  * with nothing. Everything that spans the width says so with `col-span-2`.
  */
-function TimestampedLog({ content }) {
+function TimestampedLog({ compact = false, content }) {
   const rows = useMemo(() => decorateLogRows(buildLogRows(content)), [content])
 
   if (!rows.length) {
@@ -1401,7 +1454,10 @@ function TimestampedLog({ content }) {
   }
 
   return jsx('div', {
-    className: 'grid grid-cols-[auto_minmax(0,1fr)] font-mono text-[0.75rem] text-(--ui-text-tertiary)',
+    className: cn(
+      'grid grid-cols-[auto_minmax(0,1fr)] font-mono text-(--ui-text-tertiary)',
+      compact ? 'text-[0.6875rem]' : 'text-[0.75rem]'
+    ),
     'data-selectable-text': 'true',
     style: FULL_LOG_STYLE,
     children: rows.map((row, index) => {
@@ -1555,12 +1611,12 @@ function LogSizeButton({ expanded, onClick }) {
   })
 }
 
-/** The small log inside the task view: the tail, plain, one button from full. */
+/** The small log inside the task view: the tail with its time gutter, one button from full. */
 function TaskLogSection({ expanded, onExpand, task }) {
   // Nothing behind the overlay is worth a request every three seconds.
   const { data: log, error, isLoading } = useTaskLog(task, { paused: expanded })
   const meta = logMeta(log)
-  const text = useMemo(() => plainLogText(log?.content ?? ''), [log?.content])
+  const content = log?.content ?? ''
   const placeholder = logPlaceholder({ error, isLoading, log })
 
   return jsxs(Section, {
@@ -1584,8 +1640,8 @@ function TaskLogSection({ expanded, onExpand, task }) {
         placeholder ??
         jsx(LogScroller, {
           className: 'min-h-0 flex-1 overflow-x-hidden overflow-y-auto px-2 py-1.5',
-          content: text,
-          children: jsx(PlainLog, { text })
+          content,
+          children: jsx(TimestampedLog, { compact: true, content })
         })
     })
   })
