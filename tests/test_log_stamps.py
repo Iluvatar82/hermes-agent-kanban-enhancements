@@ -111,7 +111,6 @@ def test_read_patch_strips_unless_asked(pkg, board_root, monkeypatch):
     (board_root / "logs" / "t_2.log").write_text(f"{STAMP}one\n{STAMP}two\n", encoding="utf-8")
     monkeypatch.setattr(kb, "read_worker_log",
                         lambda task_id, *, tail_bytes=None, board=None: f"{STAMP}one\n{STAMP}two\n")
-    pkg.log_stamps._read_patched = False
     assert pkg.log_stamps.install_read_patch() is True
     try:
         assert kb.read_worker_log("t_2") == "one\ntwo\n"
@@ -127,3 +126,44 @@ def test_new_run_starts_on_a_fresh_line(pkg, board_root):
     assert log.read_bytes() == b"crashed mid-li\n"
     pkg.log_stamps._start_on_a_fresh_line("t_3")
     assert log.read_bytes() == b"crashed mid-li\n"  # idempotent
+
+
+def test_read_patch_wraps_once_across_package_copies(pkg, board_root, monkeypatch, plugin_dir):
+    """What a multi-profile gateway does: the plugin is imported once per Hermes
+    home, in one process. Every copy used to wrap the previous copy's wrapper,
+    and the outer one did not forward ``timestamps`` — so the stamps were gone
+    for everyone, the Kanban+ log included."""
+    import importlib.util
+    import sys
+
+    kb = pkg.core.kanban_db()
+    raw = f"{STAMP}one\n{STAMP}two\n"
+    monkeypatch.setattr(kb, "read_worker_log", lambda task_id, *, tail_bytes=None, board=None: raw)
+    core_reader = kb.read_worker_log
+    assert pkg.log_stamps.install_read_patch() is True
+    wrapper = kb.read_worker_log
+
+    copies = []
+    try:
+        for n in range(3):
+            name = f"kanban_enhancements_copy_{n}"
+            spec = importlib.util.spec_from_file_location(
+                name, plugin_dir / "__init__.py", submodule_search_locations=[str(plugin_dir)])
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            copies.append(name)
+            assert module.log_stamps.read_patch_installed() is True
+            assert module.log_stamps.install_read_patch() is True
+
+        assert kb.read_worker_log is wrapper                 # one layer, not four
+        assert kb.read_worker_log.__wrapped__ is core_reader
+        assert kb.read_worker_log("t_1", timestamps=True) == raw
+        assert kb.read_worker_log("t_1") == "one\ntwo\n"
+    finally:
+        for name in copies:
+            for key in [key for key in sys.modules if key == name or key.startswith(f"{name}.")]:
+                del sys.modules[key]
+        pkg.log_stamps.uninstall_read_patch()
+
+    assert kb.read_worker_log is core_reader                 # any copy can take it off again

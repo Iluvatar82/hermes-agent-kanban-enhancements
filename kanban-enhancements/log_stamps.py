@@ -25,8 +25,8 @@ from .core import logger
 STAMP_RE = re.compile(
     r"^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))\] ", re.MULTILINE)
 
-_read_original = None
-_read_patched = False
+#: The marker the live ``read_worker_log`` carries while this plugin wraps it.
+READ_PATCH = "kanban_db.read_worker_log"
 
 
 def format_stamp(now: datetime | None = None) -> str:
@@ -140,11 +140,20 @@ def install_worker_streams() -> bool:
 
 
 def install_read_patch() -> bool:
-    """Wrap ``read_worker_log`` so existing readers keep the unstamped log."""
-    global _read_original, _read_patched
-    if _read_patched:
-        return True
+    """Wrap ``read_worker_log`` so existing readers keep the unstamped log.
+
+    Safe to call repeatedly and from any copy of this package. A gateway that
+    serves several profiles imports the plugin once per Hermes home, all in one
+    process — and this used to be guarded by a module global, so every copy
+    wrapped the previous copy's wrapper. The outer one forwarded only
+    ``tail_bytes``/``board``, so the inner one stripped the stamps even for a
+    caller that asked for them: the Kanban+ log lost its whole time gutter as
+    soon as a second profile's copy loaded. The marker on the live function is
+    now the single source of truth, exactly like the dispatcher guard's.
+    """
     kb = core.kanban_db()
+    if core.patched(kb, "read_worker_log", READ_PATCH):
+        return True
     original = getattr(kb, "read_worker_log", None)
     if original is None:
         return False
@@ -155,18 +164,24 @@ def install_read_patch() -> bool:
             return text
         return strip_timestamps(text)
 
-    read_worker_log.__wrapped__ = original  # type: ignore[attr-defined]
-    kb.read_worker_log = read_worker_log
-    _read_original, _read_patched = original, True
+    kb.read_worker_log = core.stamp(read_worker_log, READ_PATCH, original)
     return True
 
 
 def uninstall_read_patch() -> None:
-    global _read_original, _read_patched
-    if not _read_patched:
+    """Restore core's ``read_worker_log`` — only ever OUR wrapper, by the
+    original it recorded on itself, whichever copy of this package installed it."""
+    kb = core.kanban_db()
+    if not core.patched(kb, "read_worker_log", READ_PATCH):
         return
+    original = core.original_of(kb, "read_worker_log")
+    if original is not None:
+        kb.read_worker_log = original
+
+
+def read_patch_installed() -> bool:
+    """Whether the reader patch is live in THIS process, read off the function itself."""
     try:
-        core.kanban_db().read_worker_log = _read_original
+        return core.patched(core.kanban_db(), "read_worker_log", READ_PATCH)
     except Exception:
-        logger.debug("could not restore read_worker_log", exc_info=True)
-    _read_original, _read_patched = None, False
+        return False
